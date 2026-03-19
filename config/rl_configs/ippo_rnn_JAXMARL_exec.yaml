@@ -26,6 +26,15 @@
 "ENV_CONFIG": "config/env_configs/exec_debug_fixed_quants_complex.json"
 "ANNEAL_LR": [False]
 
+# Network architecture: rnn | rnn_wide | rnn_deep | transformer
+"ARCHITECTURE": "rnn"
+"WIDE_FACTOR": 2
+"DEEP_LAYERS": 3
+"TRANSFORMER_MODEL_DIM": 128
+"TRANSFORMER_NUM_LAYERS": 2
+"TRANSFORMER_NUM_HEADS": 4
+"TRANSFORMER_MLP_DIM": 256
+
 # Training mode: rl_cold | rl_warm | bc
 "TRAINING_MODE": "rl_cold"
 

@@ -28,8 +28,7 @@ import flax.linen as nn
 import numpy as np
 import optax
 from flax.linen.initializers import constant, orthogonal # type: ignore
-from typing import Sequence, NamedTuple, Any, Dict
-from typing import Sequence, NamedTuple, Any, Dict, Optional
+from typing import Sequence, NamedTuple, Any, Dict, Optional, Callable
 from flax.training.train_state import TrainState
 from flax.training import orbax_utils
 from flax.core import freeze, unfreeze
@@ -79,6 +78,42 @@ class ScannedRNN(nn.Module):
         # Use a dummy key since the default state init fn is just zeros.
         cell = nn.GRUCell(features=hidden_size)
         return cell.initialize_carry(jax.random.PRNGKey(0), (batch_size, hidden_size))
+
+
+def _resolve_activation(config: Dict) -> Callable[[jnp.ndarray], jnp.ndarray]:
+    activation_cfg = config.get("ACTIVATION", "relu")
+    if isinstance(activation_cfg, (list, tuple)) and len(activation_cfg) > 0:
+        activation_cfg = activation_cfg[0]
+    activation_name = str(activation_cfg).lower()
+    if activation_name == "tanh":
+        return nn.tanh
+    if activation_name == "gelu":
+        return nn.gelu
+    return nn.relu
+
+
+class TransformerEncoderBlock(nn.Module):
+    embed_dim: int
+    num_heads: int
+    mlp_dim: int
+    activation_fn: Callable[[jnp.ndarray], jnp.ndarray]
+
+    @nn.compact
+    def __call__(self, x):
+        x_norm = nn.LayerNorm()(x)
+        attn = nn.SelfAttention(
+            num_heads=self.num_heads,
+            qkv_features=self.embed_dim,
+            out_features=self.embed_dim,
+            dropout_rate=0.0,
+        )(x_norm, deterministic=True)
+        x = x + attn
+
+        y = nn.LayerNorm()(x)
+        y = nn.Dense(self.mlp_dim, kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0))(y)
+        y = self.activation_fn(y)
+        y = nn.Dense(self.embed_dim, kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0))(y)
+        return x + y
     
 class MultiActionOutputIndependant(nn.Module):
     action_dims: Sequence[int]
@@ -212,28 +247,84 @@ class ActorCriticRNN(nn.Module):
     def __call__(self, hidden, x):
         # obs, dones, avail_actions = x
         obs, dones = x
+        activation_fn = _resolve_activation(self.config)
+        architecture = str(self.config.get("ARCHITECTURE", "rnn")).lower()
 
-        embedding = nn.Dense(
-            self.config["FC_DIM_SIZE"],
-            kernel_init=orthogonal(jnp.sqrt(2)),
-            bias_init=constant(0.0),
-            name="obs_embedding",
-        )(obs)
-        embedding = nn.relu(embedding)
+        base_fc_dim = int(self.config["FC_DIM_SIZE"])
+        base_gru_dim = int(self.config["GRU_HIDDEN_DIM"])
+        wide_factor = int(self.config.get("WIDE_FACTOR", 2))
+        deep_layers = int(self.config.get("DEEP_LAYERS", 3))
 
-        rnn_in = (embedding, dones)
+        if architecture == "rnn_wide":
+            pre_dim = base_fc_dim * wide_factor
+            post_dim = base_gru_dim * wide_factor
+        else:
+            pre_dim = base_fc_dim
+            post_dim = base_gru_dim
 
-        hidden, embedding = ScannedRNN()(hidden, rnn_in)
+        embedding = obs
+        if architecture == "rnn_deep":
+            for layer_idx in range(max(1, deep_layers)):
+                embedding = nn.Dense(
+                    pre_dim,
+                    kernel_init=orthogonal(jnp.sqrt(2)),
+                    bias_init=constant(0.0),
+                    name=f"obs_embedding_{layer_idx}",
+                )(embedding)
+                embedding = activation_fn(embedding)
+            rnn_in = (embedding, dones)
+            hidden, embedding = ScannedRNN()(hidden, rnn_in)
+        elif architecture == "transformer":
+            model_dim = int(self.config.get("TRANSFORMER_MODEL_DIM", pre_dim))
+            num_layers = int(self.config.get("TRANSFORMER_NUM_LAYERS", 2))
+            num_heads = int(self.config.get("TRANSFORMER_NUM_HEADS", 4))
+            mlp_dim = int(self.config.get("TRANSFORMER_MLP_DIM", model_dim * 2))
+
+            embedding = nn.Dense(
+                model_dim,
+                kernel_init=orthogonal(jnp.sqrt(2)),
+                bias_init=constant(0.0),
+                name="obs_embedding_transformer",
+            )(embedding)
+            embedding = activation_fn(embedding)
+
+            # Transformer expects [batch, seq, feat]; inputs arrive as [seq, batch, feat]
+            embedding_bt = jnp.swapaxes(embedding, 0, 1)
+            dones_bt = jnp.swapaxes(dones, 0, 1)
+            valid_mask = (1.0 - dones_bt)[..., jnp.newaxis]
+            embedding_bt = embedding_bt * valid_mask
+
+            for block_idx in range(num_layers):
+                embedding_bt = TransformerEncoderBlock(
+                    embed_dim=model_dim,
+                    num_heads=num_heads,
+                    mlp_dim=mlp_dim,
+                    activation_fn=activation_fn,
+                    name=f"transformer_block_{block_idx}",
+                )(embedding_bt)
+
+            embedding = jnp.swapaxes(embedding_bt, 0, 1)
+            # Keep hidden for API compatibility with rollout code
+            hidden = hidden
+        else:
+            embedding = nn.Dense(
+                pre_dim,
+                kernel_init=orthogonal(jnp.sqrt(2)),
+                bias_init=constant(0.0),
+                name="obs_embedding",
+            )(embedding)
+            embedding = activation_fn(embedding)
+            rnn_in = (embedding, dones)
+            hidden, embedding = ScannedRNN()(hidden, rnn_in)
+
         actor_mean = nn.Dense(
-            self.config["GRU_HIDDEN_DIM"],
+            post_dim,
             kernel_init=orthogonal(2),
             bias_init=constant(0.0),
             name="actor_hidden",
-        )(
-            embedding
-        )
+        )(embedding)
 
-        actor_mean = nn.relu(actor_mean)
+        actor_mean = activation_fn(actor_mean)
 
         # Normalize single-element lists to int (for n_actions=1 case)
         action_dim = self.action_dim
@@ -261,12 +352,12 @@ class ActorCriticRNN(nn.Module):
             return hidden, pi
 
         critic = nn.Dense(
-            self.config["FC_DIM_SIZE"],
+            post_dim,
             kernel_init=orthogonal(2),
             bias_init=constant(0.0),
             name="critic_hidden",
         )(embedding)
-        critic = nn.relu(critic)
+        critic = activation_fn(critic)
         critic = nn.Dense(
             1,
             kernel_init=orthogonal(1.0),

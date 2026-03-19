@@ -85,7 +85,14 @@ Use config file `config/rl_configs/ippo_rnn_JAXMARL_exec.yaml` and update these 
 - `ENTITY` (set your WandB entity, or set `WANDB_MODE: offline`)
 - `PROJECT`
 - `TRAINING_MODE`
+- `ARCHITECTURE` (`rnn`, `rnn_wide`, `rnn_deep`, `transformer`)
 - BC fields (`BC_*`) or warm-start fields (`WARMSTART_*`) when needed
+
+Architecture-specific knobs:
+
+- `rnn_wide`: increase capacity with `WIDE_FACTOR`
+- `rnn_deep`: stack more pre-RNN layers with `DEEP_LAYERS`
+- `transformer`: sequence encoder with `TRANSFORMER_MODEL_DIM`, `TRANSFORMER_NUM_LAYERS`, `TRANSFORMER_NUM_HEADS`, `TRANSFORMER_MLP_DIM`
 
 Run from repo root:
 
