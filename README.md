@@ -72,6 +72,61 @@ python3 gymnax_exchange/jaxrl/MARL/ippo_rnn_JAXMARL.py \
 
 The first run preprocesses the LOBSTER data and caches it. Subsequent runs are much faster. Additional training configs are in `config/rl_configs/`. You can override any config value from the command line using [Hydra](https://hydra.cc/) syntax (e.g. `TOTAL_TIMESTEPS=50000 NUM_ENVS=64`).
 
+### BC pretraining and warm-start RL
+
+The `ippo_rnn_JAXMARL.py` runner supports three training modes via `TRAINING_MODE`:
+
+- `rl_cold`: standard RL from random initialization (default)
+- `bc`: behavior cloning (policy loss only; critic head is not used in the loss)
+- `rl_warm`: RL initialized from a previous checkpoint
+
+Use config file `config/rl_configs/ippo_rnn_JAXMARL_exec.yaml` and update these fields before running:
+
+- `ENTITY` (set your WandB entity, or set `WANDB_MODE: offline`)
+- `PROJECT`
+- `TRAINING_MODE`
+- BC fields (`BC_*`) or warm-start fields (`WARMSTART_*`) when needed
+
+Run from repo root:
+
+```bash
+cd /home/eitant/Documents/School/ML-Capstone/JaxMARL-HFT
+```
+
+Then run one of the following commands:
+
+```bash
+# 1) Behavior cloning from offline demonstrations (.npz)
+python3 gymnax_exchange/jaxrl/MARL/ippo_rnn_JAXMARL.py \
+  --config-name="ippo_rnn_JAXMARL_exec" \
+  TRAINING_MODE="bc" \
+  BC_DATA_PATH="/absolute/path/to/demos.npz"
+
+# 2) RL warm start from a BC checkpoint directory
+python3 gymnax_exchange/jaxrl/MARL/ippo_rnn_JAXMARL.py \
+  --config-name="ippo_rnn_JAXMARL_exec" \
+  TRAINING_MODE="rl_warm" \
+  WARMSTART_CHECKPOINT_DIR="/absolute/path/to/checkpoints/MARLCheckpoints/<PROJECT>/<RUN>"
+
+# 3) RL cold start (default)
+python3 gymnax_exchange/jaxrl/MARL/ippo_rnn_JAXMARL.py \
+  --config-name="ippo_rnn_JAXMARL_exec" \
+  TRAINING_MODE="rl_cold"
+```
+
+Common errors:
+
+- `ENTITY` left as `your-wandb-entity`
+- `TRAINING_MODE="bc"` but `BC_DATA_PATH` is null
+- `TRAINING_MODE="rl_warm"` with no `WARMSTART_*` source configured
+
+Expected BC dataset keys in `.npz`:
+
+- Single-agent: `obs`, `actions`, optional `dones`
+- Multi-agent type: `obs_0`, `actions_0`, optional `dones_0`, `obs_1`, ...
+
+Shapes should be either `[N, T, ...]` or `[N, ...]` (single-step is expanded to `T=1`).
+
 ### 5. WandB (optional)
 
 To enable [Weights & Biases](https://wandb.ai/) experiment tracking, run `wandb login` and then add `WANDB_MODE="online" ENTITY="your-wandb-entity" PROJECT="your-project-name"` to the training command. These can also be set directly in the YAML configs (`config/rl_configs/*.yaml`). The YAML configs support [WandB sweeps](https://docs.wandb.ai/guides/sweeps) — when a `SWEEP_PARAMETERS` section is present and `WANDB_MODE` is not `"disabled"`, training automatically creates a sweep.

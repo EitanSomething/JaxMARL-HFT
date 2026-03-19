@@ -26,6 +26,21 @@
 "ENV_CONFIG": "config/env_configs/exec_debug_fixed_quants_complex.json"
 "ANNEAL_LR": [False]
 
+# Training mode: rl_cold | rl_warm | bc
+"TRAINING_MODE": "rl_cold"
+
+# BC options (used when TRAINING_MODE="bc")
+"BC_DATA_PATH": null
+"BC_EPOCHS": 10
+"BC_BATCH_SIZE": 256
+"BC_LOG_EVERY": 1
+
+# Warm-start options (used when TRAINING_MODE="rl_warm")
+"WARMSTART_CHECKPOINT_DIR": null
+"WARMSTART_PROJECT": null
+"WARMSTART_RUN": null
+"WARMSTART_CHECKPOINT_STEP": null
+
 # WandB Params
 "ENTITY": "your-wandb-entity"
 "PROJECT": "v4_Exec_FixedQuantsComplex_Ablations" #"v4_2Player_reference_price_ablation" #"DEBUG"

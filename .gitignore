@@ -15,7 +15,7 @@ config/env_configs/default_config_*.json
 .bash_history
 jax_rwkv/**
 .bash_history
-
+checkpoints/
 gym_exchange/.DS_Store
 gym_exchange/data_orderbook_adapter/.DS_Store
 gym_exchange/orderbook/.DS_Store

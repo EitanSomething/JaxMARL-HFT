@@ -29,8 +29,10 @@ import numpy as np
 import optax
 from flax.linen.initializers import constant, orthogonal # type: ignore
 from typing import Sequence, NamedTuple, Any, Dict
+from typing import Sequence, NamedTuple, Any, Dict, Optional
 from flax.training.train_state import TrainState
 from flax.training import orbax_utils
+from flax.core import freeze, unfreeze
 import distrax
 import orbax.checkpoint as oxcp
 import hydra
@@ -204,6 +206,7 @@ class SingleActionOutput(nn.Module):
 class ActorCriticRNN(nn.Module):
     action_dim: Sequence[int]
     config: Dict
+    actor_only: bool = False
 
     @nn.compact
     def __call__(self, hidden, x):
@@ -211,22 +214,22 @@ class ActorCriticRNN(nn.Module):
         obs, dones = x
 
         embedding = nn.Dense(
-            self.config["FC_DIM_SIZE"], kernel_init=orthogonal(jnp.sqrt(2)), bias_init=constant(0.0)
+            self.config["FC_DIM_SIZE"],
+            kernel_init=orthogonal(jnp.sqrt(2)),
+            bias_init=constant(0.0),
+            name="obs_embedding",
         )(obs)
         embedding = nn.relu(embedding)
 
         rnn_in = (embedding, dones)
 
         hidden, embedding = ScannedRNN()(hidden, rnn_in)
-
-        critic = nn.Dense(self.config["FC_DIM_SIZE"], kernel_init=orthogonal(2), bias_init=constant(0.0))(
-            embedding
-        )
-        critic = nn.relu(critic)
-        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
-            critic
-        )
-        actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0))(
+        actor_mean = nn.Dense(
+            self.config["GRU_HIDDEN_DIM"],
+            kernel_init=orthogonal(2),
+            bias_init=constant(0.0),
+            name="actor_hidden",
+        )(
             embedding
         )
 
@@ -253,6 +256,23 @@ class ActorCriticRNN(nn.Module):
             )(actor_mean)
         else:
             raise ValueError("action_dims must be int or list/tuple for ActorCriticRNN.")
+
+        if self.actor_only:
+            return hidden, pi
+
+        critic = nn.Dense(
+            self.config["FC_DIM_SIZE"],
+            kernel_init=orthogonal(2),
+            bias_init=constant(0.0),
+            name="critic_hidden",
+        )(embedding)
+        critic = nn.relu(critic)
+        critic = nn.Dense(
+            1,
+            kernel_init=orthogonal(1.0),
+            bias_init=constant(0.0),
+            name="critic_out",
+        )(critic)
 
         return hidden, pi, jnp.squeeze(critic, axis=-1)
 
@@ -391,16 +411,17 @@ def create_agent_configs(config):
     1. Default attributes from the EnvironmentConfig classes
     2. Values from the JSON config
     3. Sweep parameters from AGENT_CONFIGS
-    
+
     Args:
         config: The full config dict containing both JSON config and sweep parameters
         config_dict: Dict mapping agent type names to their config classes
                     e.g., {"MarketMaking": MarketMaking_EnvironmentConfig, ...}
-    
+
     Returns:
         Dict of agent configs keyed by agent type name
     """
     agent_configs = {}
+
     if "AGENT_CONFIGS" in config:
         for agent_type, agent_cfg in config["AGENT_CONFIGS"].items():
             # Start with defaults from the config class
@@ -432,6 +453,43 @@ def create_agent_configs(config):
             agent_configs[agent_type] = agent_config_class(**overrides)
 
     return agent_configs
+
+
+def _get_npz_array(dataset: Any, primary_key: str, fallback_key: Optional[str] = None):
+    if primary_key in dataset:
+        return dataset[primary_key]
+    if fallback_key is not None and fallback_key in dataset:
+        return dataset[fallback_key]
+    raise KeyError(f"Missing key in BC dataset: '{primary_key}'")
+
+
+def _resolve_warmstart_checkpoint_dir(config: Dict) -> str:
+    if config.get("WARMSTART_CHECKPOINT_DIR"):
+        return str(config["WARMSTART_CHECKPOINT_DIR"])
+
+    warm_project = config.get("WARMSTART_PROJECT")
+    warm_run = config.get("WARMSTART_RUN")
+    if warm_project and warm_run:
+        return f'{config["world_config"]["alphatradePath"]}/checkpoints/MARLCheckpoints/{warm_project}/{warm_run}'
+
+    raise ValueError(
+        "Warm start requires WARMSTART_CHECKPOINT_DIR or both WARMSTART_PROJECT and WARMSTART_RUN."
+    )
+
+
+def _merge_params_by_key(target_params, source_params):
+    target_dict = unfreeze(target_params)
+    source_dict = unfreeze(source_params)
+
+    def _merge(target_node, source_node):
+        if isinstance(target_node, dict) and isinstance(source_node, dict):
+            for key, value in source_node.items():
+                if key in target_node:
+                    target_node[key] = _merge(target_node[key], value)
+            return target_node
+        return source_node
+
+    return freeze(_merge(target_dict, source_dict))
 
 
 def make_train(config):
@@ -510,55 +568,151 @@ def make_train(config):
         return lr * frac
 
     def train(rng, run: wandb.sdk.wandb_run.Run = None):
-        # INIT NETWORK
-        # For a given agent type (instance) we need the following inputs:
-        # Action space, obs space, 
+        training_mode = str(config.get("TRAINING_MODE", "rl_cold")).lower()
+        if training_mode not in {"bc", "rl_cold", "rl_warm"}:
+            raise ValueError("TRAINING_MODE must be one of: bc, rl_cold, rl_warm")
 
-        # The outputs that depends on these and are kept seperate are;
-        # - network, init_x, init_hstate, network_params, train_state
-        hstates = []
-        network_params_list = []
-        train_states = []
-        num_agents_of_instance_list = []
-        init_dones_agents = []
-        for i, instance in enumerate(env.instance_list):
-            # print("Action space dimension for network i ",env.action_spaces[i].n)
-            network = ActorCriticRNN(env.action_spaces[i].n, config=config)
-            rng, _rng = jax.random.split(rng)
-            init_x = (
-                jnp.zeros(
-                    (1, config["NUM_ENVS"], env.observation_spaces[i].shape[0])
-                ), # obs
-                jnp.zeros((1, config["NUM_ENVS"])), # dones
-                # jnp.zeros((1, config["NUM_ENVS"], env.action_spaces[i].n)), #     avail_actions
-            )
-
-            # FIXME: very unsure about this, why is it NUM_ENVS and not NUM_ACTORS?
-            init_hstate = ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
-            network_params = network.init(_rng, init_hstate, init_x)
-            if config["ANNEAL_LR"][i]:
-                tx = optax.chain(
-                    optax.clip_by_global_norm(config["MAX_GRAD_NORM"][i]),
-                    optax.adam(learning_rate=functools.partial(linear_schedule,config["LR"][i]), eps=1e-5),
+        def _init_train_states(rng_in, actor_only: bool = False):
+            hstates_local = []
+            train_states_local = []
+            init_dones_agents_local = []
+            for i, _ in enumerate(env.instance_list):
+                network = ActorCriticRNN(env.action_spaces[i].n, config=config, actor_only=actor_only)
+                rng_in, _rng_local = jax.random.split(rng_in)
+                init_x_local = (
+                    jnp.zeros((1, config["NUM_ENVS"], env.observation_spaces[i].shape[0])),
+                    jnp.zeros((1, config["NUM_ENVS"])),
                 )
-            else:
-                tx = optax.chain(
-                    optax.clip_by_global_norm(config["MAX_GRAD_NORM"][i]),
-                    optax.adam(config["LR"][i], eps=1e-5),
-                )
-            train_state = TrainState.create(
-                apply_fn=network.apply,
-                params=network_params,
-                tx=tx,
-            )
-            init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS_PERTYPE"][i], config["GRU_HIDDEN_DIM"])
 
-            # Instead of appending dicts, maintain separate lists for each attribute
-            hstates.append(init_hstate)
-            network_params_list.append(network_params)
-            train_states.append(train_state)
-            num_agents_of_instance_list.append(env.multi_agent_config.number_of_agents_per_type[i])
-            init_dones_agents.append(jnp.zeros((config["NUM_ACTORS_PERTYPE"][i]), dtype=bool))
+                init_hstate_local = ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
+                network_params_local = network.init(_rng_local, init_hstate_local, init_x_local)
+                if config["ANNEAL_LR"][i]:
+                    tx = optax.chain(
+                        optax.clip_by_global_norm(config["MAX_GRAD_NORM"][i]),
+                        optax.adam(learning_rate=functools.partial(linear_schedule, config["LR"][i]), eps=1e-5),
+                    )
+                else:
+                    tx = optax.chain(
+                        optax.clip_by_global_norm(config["MAX_GRAD_NORM"][i]),
+                        optax.adam(config["LR"][i], eps=1e-5),
+                    )
+                train_state_local = TrainState.create(
+                    apply_fn=network.apply,
+                    params=network_params_local,
+                    tx=tx,
+                )
+                init_hstate_local = ScannedRNN.initialize_carry(config["NUM_ACTORS_PERTYPE"][i], config["GRU_HIDDEN_DIM"])
+                hstates_local.append(init_hstate_local)
+                train_states_local.append(train_state_local)
+                init_dones_agents_local.append(jnp.zeros((config["NUM_ACTORS_PERTYPE"][i]), dtype=bool))
+            return rng_in, hstates_local, train_states_local, init_dones_agents_local
+
+        rng, hstates, train_states, init_dones_agents = _init_train_states(
+            rng,
+            actor_only=(training_mode == "bc"),
+        )
+
+        if training_mode == "bc":
+            bc_data_path = config.get("BC_DATA_PATH")
+            if not bc_data_path:
+                raise ValueError("BC mode requires BC_DATA_PATH to be set (npz file).")
+
+            dataset = np.load(bc_data_path)
+            bc_epochs = int(config.get("BC_EPOCHS", 10))
+            bc_batch_size = int(config.get("BC_BATCH_SIZE", 256))
+            bc_log_every = int(config.get("BC_LOG_EVERY", 1))
+            bc_losses = []
+
+            for i, train_state in enumerate(train_states):
+                obs = _get_npz_array(dataset, f"obs_{i}", "obs")
+                actions = _get_npz_array(dataset, f"actions_{i}", "actions")
+                dones = dataset[f"dones_{i}"] if f"dones_{i}" in dataset else (dataset["dones"] if "dones" in dataset else None)
+
+                if obs.ndim == 2:
+                    obs = obs[:, None, :]
+                if actions.ndim == 1:
+                    actions = actions[:, None]
+                if dones is None:
+                    dones = np.zeros((obs.shape[0], obs.shape[1]), dtype=np.float32)
+                elif dones.ndim == 1:
+                    dones = dones[:, None]
+
+                num_samples = int(obs.shape[0])
+                if num_samples == 0:
+                    raise ValueError(f"BC dataset for agent index {i} is empty.")
+
+                @jax.jit
+                def _bc_update(train_state_in, obs_batch, done_batch, action_batch):
+                    def _loss_fn(params):
+                        init_h = ScannedRNN.initialize_carry(obs_batch.shape[0], config["GRU_HIDDEN_DIM"])
+                        obs_t = jnp.swapaxes(obs_batch, 0, 1)
+                        done_t = jnp.swapaxes(done_batch, 0, 1)
+                        action_t = jnp.swapaxes(action_batch, 0, 1)
+                        _, pi = train_state_in.apply_fn(params, init_h, (obs_t, done_t))
+                        return -pi.log_prob(action_t).mean()
+
+                    loss, grads = jax.value_and_grad(_loss_fn)(train_state_in.params)
+                    train_state_out = train_state_in.apply_gradients(grads=grads)
+                    return train_state_out, loss
+
+                epoch_loss = 0.0
+                for epoch in range(bc_epochs):
+                    perm = np.random.permutation(num_samples)
+                    losses_this_epoch = []
+                    for start in range(0, num_samples, bc_batch_size):
+                        batch_idx = perm[start:start + bc_batch_size]
+                        obs_batch = jnp.asarray(obs[batch_idx])
+                        done_batch = jnp.asarray(dones[batch_idx])
+                        action_batch = jnp.asarray(actions[batch_idx])
+                        train_state, loss = _bc_update(train_state, obs_batch, done_batch, action_batch)
+                        losses_this_epoch.append(loss)
+
+                    epoch_loss = float(jnp.mean(jnp.asarray(losses_this_epoch)))
+                    if (epoch + 1) % bc_log_every == 0:
+                        print(f"BC agent {i} epoch {epoch + 1}/{bc_epochs} loss={epoch_loss:.6f}")
+                        if config["WANDB_MODE"] != "disabled" and run is not None:
+                            wandb.log({f"bc/agent_{agent_type_names[i]}_loss": epoch_loss, "bc/epoch": epoch + 1})
+
+                bc_losses.append(epoch_loss)
+                train_states[i] = train_state
+
+            checkpoint_dir = f'{config["world_config"]["alphatradePath"]}/checkpoints/MARLCheckpoints/{config["PROJECT"]}/{(run.name if run and run.name else run.id) if run else "GENERIC_RUN"}'
+            orbax_checkpointer = oxcp.PyTreeCheckpointer()
+            checkpoint_manager = oxcp.CheckpointManager(
+                checkpoint_dir,
+                orbax_checkpointer,
+                oxcp.CheckpointManagerOptions(max_to_keep=2, create=True),
+            )
+            bc_ckpt = {
+                "model": train_states,
+                "metrics": {"bc_losses": bc_losses},
+            }
+            save_args = orbax_utils.save_args_from_target(bc_ckpt)
+            checkpoint_manager.save(bc_epochs, bc_ckpt, save_kwargs={"save_args": save_args})
+            checkpoint_manager.wait_until_finished()
+            dataset.close()
+            print(f"BC training complete. Saved checkpoint step={bc_epochs} to {checkpoint_dir}")
+            return {"runner_state": (train_states,), "bc_losses": bc_losses}
+
+        if training_mode == "rl_warm":
+            warm_ckpt_dir = _resolve_warmstart_checkpoint_dir(config)
+            orbax_checkpointer = oxcp.PyTreeCheckpointer()
+            checkpoint_manager = oxcp.CheckpointManager(warm_ckpt_dir, orbax_checkpointer)
+            warm_step = config.get("WARMSTART_CHECKPOINT_STEP", None)
+            if warm_step is None:
+                warm_step = checkpoint_manager.latest_step()
+            if warm_step is None:
+                raise ValueError(f"No checkpoint found in warm-start directory: {warm_ckpt_dir}")
+
+            restored_state = checkpoint_manager.restore(int(warm_step))
+            restored_train_states = restored_state["model"] if isinstance(restored_state, dict) and "model" in restored_state else restored_state
+            train_states = [
+                train_states[i].replace(
+                    params=_merge_params_by_key(train_states[i].params, restored_train_states[i].params)
+                )
+                for i in range(len(train_states))
+            ]
+            print(f"Loaded warm-start params from {warm_ckpt_dir} at step {warm_step}")
 
         # INIT ENV
         rng, _rng = jax.random.split(rng)
@@ -1219,7 +1373,7 @@ def main(config):
         run=wandb.init(
             entity=config["ENTITY"], # type: ignore
             project=config["PROJECT"], # type: ignore
-            tags=["IPPO", "RNN"], # type: ignore
+            tags=["IPPO", "RNN", str(config.get("TRAINING_MODE", "rl_cold"))], # type: ignore
             config=config, # type: ignore
             mode=config["WANDB_MODE"], # type: ignore
             allow_val_change=True,
