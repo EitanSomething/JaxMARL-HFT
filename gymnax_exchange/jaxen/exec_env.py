@@ -171,6 +171,8 @@ class ExecutionAgent():
             self.action_fn = self._getActionMsgs_fixedQuant_1msg
         elif self.cfg.action_space == "twap":
             self.action_fn = self._getActionMsgs_twap
+        elif self.cfg.action_space == "execute_hold":
+            self.action_fn = self._getActionMsgs_executeHold
         else:
             raise ValueError("Invalid action_space specified.")
 
@@ -182,6 +184,8 @@ class ExecutionAgent():
             self.observation_fn = self._get_obs_basic
         elif self.cfg.observation_space == "simplest_case":
             self.observation_fn = self._get_obs_simplest_case
+        elif self.cfg.observation_space == "vwap_engineered":
+            self.observation_fn = self._get_obs_vwap_engineered
         else:
             raise ValueError("Invalid observation_space specified.")
 
@@ -238,6 +242,8 @@ class ExecutionAgent():
             vwap_rm = 0.,
             is_sell_task = is_sell_task,
             trade_duration = 0.,
+            market_vwap_num = 0.,
+            market_vwap_den = 0.,
         )
 
         # Calculate things for the message obs space
@@ -997,6 +1003,34 @@ class ExecutionAgent():
         action_msgs = jnp.concatenate([action_msgs, times],axis=1)
         return action_msgs,{}
 
+
+    def _getActionMsgs_executeHold(self, action: jax.Array, world_state: WorldState, agent_state: ExecEnvState, agent_params: ExecEnvParams):
+        """Binary execute/hold action space: 0=hold, 1=execute at far touch."""
+        best_ask = jnp.int32((world_state.best_asks[-1][0] // self.world_config.tick_size) * self.world_config.tick_size)
+        best_bid = jnp.int32((world_state.best_bids[-1][0] // self.world_config.tick_size) * self.world_config.tick_size)
+
+        ft_price = jax.lax.cond(
+            agent_state.is_sell_task,
+            lambda: best_bid,
+            lambda: best_ask,
+        )
+
+        quant = jnp.where(action == 1, self.cfg.fixed_quant_value, 0).astype(jnp.int32)
+        quant_left = agent_state.task_to_execute - agent_state.quant_executed
+        quant = jnp.minimum(quant, quant_left)
+
+        types = jnp.ones((1,), jnp.int32)
+        sides = (1 - agent_state.is_sell_task * 2) * jnp.ones((1,), jnp.int32)
+        trader_ids = jnp.ones((1,), jnp.int32) * agent_params.trader_id
+        order_ids = jnp.full((1,), self.world_config.placeholder_order_id, dtype=jnp.int32)
+        times = jnp.resize(world_state.time + self.cfg.time_delay_obs_act, (1, 2))
+        quants = jnp.array([quant])
+        prices = jnp.array([ft_price])
+
+        action_msgs = jnp.stack([types, sides, quants, prices, order_ids, trader_ids], axis=1)
+        action_msgs = jnp.concatenate([action_msgs, times], axis=1)
+        return action_msgs, {}
+
     
     def _getActionMsgs_fixedPrice(self, action: jax.Array, world_state: WorldState, agent_state: ExecEnvState, agent_params: ExecEnvParams):
         """get messages for action space where input is quantity at each price level"""
@@ -1306,6 +1340,8 @@ class ExecutionAgent():
             return self.action_fn(action = action, world_state = world_state, agent_state = agent_state, agent_params = agent_params)
         elif self.cfg.action_space == "twap":
             return self.action_fn(action = action, world_state = world_state, agent_state = agent_state, agent_params = agent_params)
+        elif self.cfg.action_space == "execute_hold":
+            return self.action_fn(action = action, world_state = world_state, agent_state = agent_state, agent_params = agent_params)
         else:
             raise ValueError("Invalid action space specified.")    
     
@@ -1327,6 +1363,11 @@ class ExecutionAgent():
         elif self.cfg.observation_space == "simplest_case":
             return self.observation_fn(world_state=world_state, 
                                        agent_state=agent_state, 
+                                       normalize=normalize,
+                                       flatten=flatten)
+        elif self.cfg.observation_space == "vwap_engineered":
+            return self.observation_fn(agent_state=agent_state,
+                                       world_state=world_state,
                                        normalize=normalize,
                                        flatten=flatten)
         else:
@@ -1713,6 +1754,23 @@ class ExecutionAgent():
         trade_duration = agent_state.trade_duration + trade_duration_step
         quant_left = agent_state.task_to_execute - agent_state.quant_executed - agentQuant
 
+        other_pq = (jnp.abs(otherTrades[:, job.cst.TradesFeat.Q.value]) *
+                    (otherTrades[:, job.cst.TradesFeat.P.value] // self.world_config.tick_size)).sum()
+        new_market_vwap_num = agent_state.market_vwap_num + other_pq
+        new_market_vwap_den = agent_state.market_vwap_den + otherQuant
+
+        cumul_market_vwap = jnp.where(
+            new_market_vwap_den > 0,
+            new_market_vwap_num / new_market_vwap_den,
+            agent_state.init_price / self.world_config.tick_size,
+        )
+        cumul_agent_avg = jnp.where(
+            (agent_state.total_revenue + QP_agent) > 0,
+            (agent_state.total_revenue + QP_agent) / (agent_state.quant_executed + agentQuant + 1e-9),
+            agent_state.init_price / self.world_config.tick_size,
+        )
+        adj_slippage_bps = (cumul_agent_avg - cumul_market_vwap) / (cumul_market_vwap + 1e-9) * 10000
+
         reward_info={
         "reward":reward,
         "agentQuant": agentQuant,
@@ -1728,6 +1786,9 @@ class ExecutionAgent():
         "doom_quant": doom_quant,
         "quant_left": quant_left,
         "trade_duration": trade_duration,
+        "market_vwap_num": new_market_vwap_num,
+        "market_vwap_den": new_market_vwap_den,
+        "adj_slippage_bps": adj_slippage_bps,
         }
 
         # jax.debug.callback(large_reward_callback,reward,jnp.abs(reward),trades,P_vwap,world_state.window_index,QP_agent,agentQuant)
@@ -1738,6 +1799,11 @@ class ExecutionAgent():
         if self.cfg.reward_function == "finish_fast":
             # Purely for debug, not worth reporting.
             reward = -jnp.abs(quant_left) 
+            reward_scaled = reward / self.cfg.reward_scaling_quo
+
+
+        if self.cfg.reward_function == "vwap_tracking":
+            reward = -jnp.abs(cumul_agent_avg - cumul_market_vwap) * agentQuant
             reward_scaled = reward / self.cfg.reward_scaling_quo
 
 
@@ -1793,7 +1859,9 @@ class ExecutionAgent():
             price_adv_rm = new_price_adv_rm,
             price_drift_rm = new_price_drift_rm,
             vwap_rm = new_vwap_rm,
-            trade_duration = new_trade_duration)
+            trade_duration = new_trade_duration,
+            market_vwap_num = extras["market_vwap_num"],
+            market_vwap_den = extras["market_vwap_den"])
         
         # Get done
         done = self.is_terminal(world_state, agent_state)
@@ -1826,6 +1894,7 @@ class ExecutionAgent():
             "doom_quant": doom_quant,
             "is_sell_task": agent_state.is_sell_task,
             "reward": new_reward,
+            "adj_slippage_bps": extras["adj_slippage_bps"],
         }
 
         def debug_info_callback(info):
@@ -2079,6 +2148,98 @@ class ExecutionAgent():
         return obs
 
 
+    def _get_obs_vwap_engineered(
+            self,
+            agent_state: ExecEnvState,
+            world_state: WorldState,
+            normalize: bool,
+            flatten: bool = True,
+        ) -> chex.Array:
+        """VWAP-tracking engineered observation with fixed 15-feature layout."""
+        best_bid_price = world_state.best_bids[-1][0]
+        best_ask_price = world_state.best_asks[-1][0]
+        best_bid_size = world_state.best_bids[-1][1]
+        best_ask_size = world_state.best_asks[-1][1]
+
+        mid_price = (best_ask_price + best_bid_price) / 2.0
+        spread = best_ask_price - best_bid_price
+        spread_pct = jnp.where(mid_price > 0, spread / mid_price, 0.0)
+
+        total_best = best_bid_size + best_ask_size
+        imbalance_best = jnp.where(total_best > 0, (best_bid_size - best_ask_size) / total_best, 0.0)
+
+        total_bid_volume = job.get_volume(world_state.bid_raw_orders)
+        total_ask_volume = job.get_volume(world_state.ask_raw_orders)
+        total_volume = total_bid_volume + total_ask_volume
+        imbalance = jnp.where(total_volume > 0, (total_bid_volume - total_ask_volume) / total_volume, 0.0)
+
+        weighted_mid_price = jnp.where(
+            total_best > 0,
+            (best_bid_price * best_ask_size + best_ask_price * best_bid_size) / total_best,
+            mid_price,
+        )
+
+        task_size = jnp.float32(agent_state.task_to_execute)
+        executed = jnp.float32(agent_state.quant_executed)
+        remaining_pct = jnp.where(task_size > 0, (task_size - executed) / task_size, 0.0)
+        execution_progress = jnp.where(task_size > 0, executed / task_size, 1.0)
+
+        time = world_state.time[0] + world_state.time[1] / 1e9
+        time_elapsed = time - (world_state.init_time[0] + world_state.init_time[1] / 1e9)
+        episode_time = self.world_config.episode_time
+        time_remaining_pct = jnp.where(
+            episode_time > 0,
+            (episode_time - time_elapsed) / episode_time,
+            0.0,
+        )
+
+        num_batches = jnp.where(self.cfg.fixed_quant_value > 0,
+            jnp.ceil(task_size / self.cfg.fixed_quant_value), 1.0)
+
+        raw_obs = jnp.array([
+            mid_price,
+            spread,
+            spread_pct,
+            best_bid_size,
+            best_ask_size,
+            imbalance_best,
+            total_bid_volume,
+            total_ask_volume,
+            imbalance,
+            weighted_mid_price,
+            remaining_pct,
+            time_remaining_pct,
+            execution_progress,
+            num_batches / 50.0,
+            1.0 - time_remaining_pct,
+        ], dtype=jnp.float32)
+
+        if normalize:
+            scales = jnp.array([
+                20_000_000.0,
+                500.0,
+                1.0,
+                500.0,
+                500.0,
+                1.0,
+                2000.0,
+                2000.0,
+                1.0,
+                20_000_000.0,
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+            ], dtype=jnp.float32)
+            obs = raw_obs / scales
+            obs = obs.at[2].set(raw_obs[2] * 10000.0)
+        else:
+            obs = raw_obs
+
+        return obs
+
+
 
 
     def _get_obs_full(self, state: ExecEnvState, params:ExecEnvParams) -> chex.Array:
@@ -2181,6 +2342,8 @@ class ExecutionAgent():
             return spaces.Discrete(self.cfg.n_actions)
         elif self.cfg.action_space=="twap":
             return spaces.Discrete(self.cfg.n_actions)
+        elif self.cfg.action_space=="execute_hold":
+            return spaces.Discrete(self.cfg.n_actions)
         else:    
             raise ValueError("Invalid action_space specified.")
 
@@ -2197,6 +2360,9 @@ class ExecutionAgent():
             return space
         elif self.cfg.observation_space == "simplest_case":
             space = spaces.Box(-10000, 10000, (3,), dtype=jnp.float32) 
+            return space
+        elif self.cfg.observation_space == "vwap_engineered":
+            space = spaces.Box(-10000, 10000, (15,), dtype=jnp.float32)
             return space
         else:
             raise ValueError("Invalid observation_space specified.")

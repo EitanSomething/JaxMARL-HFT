@@ -153,9 +153,10 @@ class Execution_EnvironmentConfig():
 
     # Real Parameters
     task: str = "random"  # options: "random", "buy", "sell"
-    action_space: str = "fixed_quants_complex"  # options: "fixed_quants", "fixed_prices", "fixed_quants_complex", "simplest_case", "fixed_quants_1msg"
-    observation_space: str = "engineered"  # options: "engineered", "basic", "simplest_case"
-    reward_function: str = "normal"  # options: "normal", "finish_fast", "simplest_case"
+    action_space: str = "fixed_quants_complex"  # options: "fixed_quants", "fixed_prices", "fixed_quants_complex", "simplest_case", "fixed_quants_1msg", "execute_hold"
+    observation_space: str = "engineered"  # options: "engineered", "basic", "simplest_case", "vwap_engineered"
+    reward_function: str = "normal"  # options: "normal", "finish_fast", "simplest_case", "vwap_tracking"
+    benchmark_type: str = "advantage"  # options: "advantage", "vwap_tracking"
     task_size:int= 600
     n_ticks_in_book : int = 1
     fixed_quant_value:int=10
@@ -198,6 +199,10 @@ class Execution_EnvironmentConfig():
             object.__setattr__(self, 'n_actions', 1)
             object.__setattr__(self, 'num_messages_by_agent', 4)
             object.__setattr__(self, 'num_action_messages_by_agent', 2)
+        elif self.action_space == "execute_hold":
+            object.__setattr__(self, 'n_actions', 2)
+            object.__setattr__(self, 'num_messages_by_agent', 2)
+            object.__setattr__(self, 'num_action_messages_by_agent', 1)
 
 
 

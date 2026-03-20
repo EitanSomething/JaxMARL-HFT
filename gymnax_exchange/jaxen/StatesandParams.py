@@ -70,8 +70,10 @@ class ExecEnvState():
     price_adv_rm: float
     price_drift_rm: float
     vwap_rm: float
-    #Skip, not sure what the purpose is
     trade_duration: float
+    # VWAP tracking accumulators from non-agent market trades
+    market_vwap_num: float
+    market_vwap_den: float
 
 
 
