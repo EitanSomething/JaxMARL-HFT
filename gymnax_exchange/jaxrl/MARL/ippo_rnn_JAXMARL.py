@@ -3,8 +3,8 @@ Based on PureJaxRL Implementation of PPO
 """
 
 import os
+from pathlib import Path
 
-import pandas as pd
 import csv
 import wandb.sdk
 
@@ -388,6 +388,10 @@ class MultiCategorical():
         log_probs = [cat.log_prob(actions[...,i]) for i, cat in enumerate(self.categoricals)]
         return jnp.sum(jnp.stack(log_probs, axis=-1), axis=-1)  # Sum log probs for independence
     
+    def mode(self):
+        modes = [cat.mode() for cat in self.categoricals]
+        return jnp.stack(modes, axis=-1)
+
     def entropy(self):
         entropies = [cat.entropy() for cat in self.categoricals]
         return jnp.sum(jnp.stack(entropies, axis=-1), axis=-1)  # Sum entropies for independence
@@ -452,7 +456,15 @@ class AutoregressiveMultiCategorical():
         
         # Sum log probabilities (chain rule)
         return jnp.sum(jnp.stack(log_probs, axis=-1), axis=-1)
-    
+
+    def mode(self):
+        """Get the most likely sequence."""
+        modes = []
+        for i in range(len(self.action_dims)):
+            logits = self.logits_fn(self.actor_features, i, modes)
+            modes.append(jnp.argmax(logits, axis=-1))
+        return jnp.stack(modes, axis=-1)
+
     def entropy(self):
         """
         Compute entropy of the autoregressive distribution.
@@ -704,69 +716,369 @@ def make_train(config):
         )
 
         if training_mode == "bc":
-            bc_data_path = config.get("BC_DATA_PATH")
-            if not bc_data_path:
-                raise ValueError("BC mode requires BC_DATA_PATH to be set (npz file).")
-
-            dataset = np.load(bc_data_path)
+            # Initialize environment parameters
+            env_params = env.default_params
+            
+            # Behavior Cloning: Collect trajectories from environment using expert policies
+            expert_policy = config.get("EXPERT_POLICY", "twap")
+            bc_episodes = int(config.get("BC_EPISODES", 50))
             bc_epochs = int(config.get("BC_EPOCHS", 10))
             bc_batch_size = int(config.get("BC_BATCH_SIZE", 256))
             bc_log_every = int(config.get("BC_LOG_EVERY", 1))
+            
+            print(f"Behavior Cloning: Collecting {bc_episodes} episodes using {expert_policy.upper()} policy...")
+            print(f"  WANDB_MODE={config['WANDB_MODE']}, run={run}, run is not None={run is not None}")
+            
+            # Collect trajectories from environment rollouts
+            obs_buffer = {i: [] for i in range(len(env.instance_list))}
+            action_buffer = {i: [] for i in range(len(env.instance_list))}
+            done_buffer = {i: [] for i in range(len(env.instance_list))}
+            episode_prices_slippage = {i: [] for i in range(len(env.instance_list))}
+            per_step_slippage = {i: {step: [] for step in range(config["NUM_STEPS"])} for i in range(len(env.instance_list))}
+            
+            for episode_num in range(bc_episodes):
+                rng, reset_key = jax.random.split(rng)
+                reset_rng = jax.random.split(reset_key, config["NUM_ENVS"])
+                obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
+                
+                # Initialize hidden states and dones for all agents
+                hstates_local = []
+                init_dones_local = []
+                for i in range(len(env.instance_list)):
+                    hstates_local.append(ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"]))
+                    init_dones_local.append(jnp.zeros((config["NUM_ENVS"],), dtype=bool))
+                
+                for step_idx in range(config["NUM_STEPS"]):
+                    rng, policy_key, step_key = jax.random.split(rng, 3)
+                    step_keys = jax.random.split(step_key, config["NUM_ENVS"])
+                    
+                    # Get expert actions (using env's action space)
+                    actions = []
+                    for i, space in enumerate(env.action_spaces):
+                        if expert_policy.lower() == "twap":
+                            # TWAP: execute every 10 steps
+                            twap_action = 1 if (step_idx % 10) == 0 else 0
+                            action = jnp.full((config["NUM_ENVS"],), twap_action, dtype=jnp.int32)
+                        elif expert_policy.lower() == "vwap":
+                            # VWAP: front-loaded (70% in first half, 30% in second half)
+                            if step_idx < 0.7 * config["NUM_STEPS"]:
+                                vwap_action = 1
+                            else:
+                                vwap_action = 0
+                            action = jnp.full((config["NUM_ENVS"],), vwap_action, dtype=jnp.int32)
+                        else:
+                            # Random fallback
+                            subkeys = jax.random.split(policy_key, config["NUM_ENVS"])
+                            action = jax.vmap(space.sample)(subkeys)
+                        actions.append(action)
+                    
+                    # Store observations and actions
+                    for i in range(len(env.instance_list)):
+                        obs_buffer[i].append(np.asarray(obsv[i]))
+                        action_buffer[i].append(np.asarray(actions[i]))
+                    
+                    # Step environment
+                    obsv, env_state, reward, done, info = jax.vmap(
+                        env.step, in_axes=(0, 0, 0, None)
+                    )(step_keys, env_state, actions, env_params)
+                    
+                    # Store dones and collect price slippage at every step
+                    for i in range(len(env.instance_list)):
+                        done_np = np.asarray(done["agents"][i])
+                        done_buffer[i].append(done_np)
+                        
+                        # Collect price slippage from every step (average later)
+                        if "adj_slippage_bps" in info["agents"][i]:
+                            adj_slip_np = np.asarray(info["agents"][i]["adj_slippage_bps"])
+                            # adj_slip_np has shape (NUM_ENVS,), extract mean for this step
+                            step_mean_slippage = float(np.mean(adj_slip_np))
+                            episode_prices_slippage[i].append(step_mean_slippage)
+                            # Also collect per-step slippage for statistics
+                            if step_idx < config["NUM_STEPS"]:
+                                per_step_slippage[i][step_idx].append(step_mean_slippage)
+                    
+                    # Reset on episode done
+                    done_all = np.asarray(done["__all__"])
+                    if np.all(done_all):
+                        break
+            
+            print(f"BC Dataset Statistics:")
+            
+            # Print collected price slippage statistics
+            for i in range(len(env.instance_list)):
+                if len(episode_prices_slippage[i]) > 0:
+                    mean_slippage = float(np.mean(episode_prices_slippage[i]))
+                    std_slippage = float(np.std(episode_prices_slippage[i]))
+                    print(f"  Agent {i}: collected {len(episode_prices_slippage[i])} steps with avg price_slippage={mean_slippage:.2f}bps (±{std_slippage:.2f}bps)")
+                    # Print per-step slippage breakdown
+                    print(f"    Per-step slippage for Agent {i}:")
+                    for step in range(config["NUM_STEPS"]):
+                        if per_step_slippage[i][step]:
+                            step_slips = per_step_slippage[i][step]
+                            step_mean = float(np.mean(step_slips))
+                            step_std = float(np.std(step_slips))
+                            step_min = float(np.min(step_slips))
+                            step_max = float(np.max(step_slips))
+                            print(f"      Step {step:3d}: mean={step_mean:7.2f}bps, std={step_std:6.2f}bps, min={step_min:7.2f}bps, max={step_max:7.2f}bps (n={len(step_slips)})")
+                else:
+                    print(f"  Agent {i}: NO price slippage data collected")
+            
+            # Create per-step slippage visualization
+            fig, axes = plt.subplots(1, len(env.instance_list), figsize=(12 * len(env.instance_list), 6), squeeze=False)
+            axes = axes[0]
+            
+            for i in range(len(env.instance_list)):
+                ax = axes[i]
+                if episode_prices_slippage[i]:
+                    # Plot mean slippage across all collected steps
+                    all_slippage = episode_prices_slippage[i]
+                    steps = np.arange(len(all_slippage))
+                    
+                    # Plot clean line of mean slippage
+                    ax.plot(steps, all_slippage, 'b-', linewidth=1.5, alpha=0.8)
+                    
+                    # Add zero line
+                    ax.axhline(y=0, color='k', linestyle='--', alpha=0.3, linewidth=1)
+                    
+                    ax.set_xlabel('Collected Steps', fontsize=12)
+                    ax.set_ylabel('Mean Slippage (bps)', fontsize=12)
+                    ax.set_title(f'Agent {i}: Slippage Across All Collected Steps', fontsize=13, fontweight='bold')
+                    ax.grid(True, alpha=0.3)
+                
+            plt.tight_layout()
+            
+            # Save figure
+            fig_path = f'{config["world_config"]["alphatradePath"]}/bc_slippage_plot.png'
+            plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+            print(f"✓ Saved per-step slippage plot to {fig_path}")
+            
+            # Log figure to wandb
+            if config["WANDB_MODE"] != "disabled" and run is not None:
+                try:
+                    wandb.log({"bc/per_step_slippage_plot": wandb.Image(fig_path)}, commit=False)
+                    print(f"✓ Logged per-step slippage plot to wandb")
+                except Exception as e:
+                    print(f"⚠ Failed to log plot to wandb: {e}")
+            
+            plt.close(fig)
+            
             bc_losses = []
-
+            
+            # Global step counter across all agents and epochs
+            global_step_for_bc = 0
+            
             for i, train_state in enumerate(train_states):
-                obs = _get_npz_array(dataset, f"obs_{i}", "obs")
-                actions = _get_npz_array(dataset, f"actions_{i}", "actions")
-                dones = dataset[f"dones_{i}"] if f"dones_{i}" in dataset else (dataset["dones"] if "dones" in dataset else None)
-
-                if obs.ndim == 2:
-                    obs = obs[:, None, :]
-                if actions.ndim == 1:
-                    actions = actions[:, None]
-                if dones is None:
-                    dones = np.zeros((obs.shape[0], obs.shape[1]), dtype=np.float32)
-                elif dones.ndim == 1:
-                    dones = dones[:, None]
-
-                num_samples = int(obs.shape[0])
+                # Convert buffers to arrays
+                obs = np.concatenate(obs_buffer[i], axis=0)  # (total_steps, num_envs, obs_dim)
+                actions = np.concatenate(action_buffer[i], axis=0)  # (total_steps, num_envs)
+                dones = np.concatenate(done_buffer[i], axis=0)  # (total_steps, num_envs)
+                
+                print(f"  Agent {i}: obs shape {obs.shape}, actions {actions.shape}, dones {dones.shape}")
+                
+                # Reshape for BC training
+                obs = obs.reshape(-1, obs.shape[-1])  # Flatten environments and steps
+                actions = actions.reshape(-1)
+                dones = dones.reshape(-1)
+                
+                num_samples = len(actions)
                 if num_samples == 0:
-                    raise ValueError(f"BC dataset for agent index {i} is empty.")
-
+                    raise ValueError(f"BC dataset for agent {i} is empty")
+                
+                # Split train/val
+                val_split = int(0.2 * num_samples)
+                perm = np.random.permutation(num_samples)
+                val_idx = perm[:val_split]
+                train_idx = perm[val_split:]
+                
+                obs_train = obs[train_idx]
+                actions_train = actions[train_idx]
+                dones_train = dones[train_idx]
+                
+                obs_val = obs[val_idx]
+                actions_val = actions[val_idx]
+                dones_val = dones[val_idx]
+                
+                num_train_samples = len(train_idx)
+                
+                # Debug: Print class distribution
+                unique_train, counts_train = np.unique(actions_train, return_counts=True)
+                unique_val, counts_val = np.unique(actions_val, return_counts=True)
+                print(f"  Agent {i} class distribution - Train: {dict(zip(unique_train, counts_train))}, Val: {dict(zip(unique_val, counts_val))}")
+                class_dist_train = {int(k): int(v) for k, v in zip(unique_train, counts_train)}
+                class_dist_val = {int(k): int(v) for k, v in zip(unique_val, counts_val)}
+                
+                # Compute class weights (inverse frequency) to handle imbalance
+                n_class_0 = np.sum(actions_train == 0)
+                n_class_1 = np.sum(actions_train == 1)
+                weight_class_0 = n_class_1 / (n_class_0 + n_class_1) if n_class_0 > 0 else 1.0
+                weight_class_1 = n_class_0 / (n_class_0 + n_class_1) if n_class_1 > 0 else 1.0
+                print(f"  Agent {i} class weights - class_0: {weight_class_0:.4f}, class_1: {weight_class_1:.4f}")
+                
                 @jax.jit
                 def _bc_update(train_state_in, obs_batch, done_batch, action_batch):
                     def _loss_fn(params):
+                        # Reshape for time dimension
                         init_h = ScannedRNN.initialize_carry(obs_batch.shape[0], config["GRU_HIDDEN_DIM"])
-                        obs_t = jnp.swapaxes(obs_batch, 0, 1)
-                        done_t = jnp.swapaxes(done_batch, 0, 1)
-                        action_t = jnp.swapaxes(action_batch, 0, 1)
+                        obs_t = jnp.expand_dims(obs_batch, 0)  # Add time dim
+                        done_t = jnp.expand_dims(done_batch, 0)
+                        action_t = jnp.expand_dims(action_batch, 0)
                         _, pi = train_state_in.apply_fn(params, init_h, (obs_t, done_t))
-                        return -pi.log_prob(action_t).mean()
-
+                        log_probs = pi.log_prob(action_t)
+                        
+                        # Apply class weights: give higher weight to minority class
+                        # action_batch is in range [0, num_actions-1]
+                        weights = jnp.where(action_batch == 0, weight_class_0, weight_class_1)
+                        weighted_log_probs = log_probs.squeeze(0) * weights
+                        return -weighted_log_probs.mean()
+                    
                     loss, grads = jax.value_and_grad(_loss_fn)(train_state_in.params)
                     train_state_out = train_state_in.apply_gradients(grads=grads)
                     return train_state_out, loss
-
-                epoch_loss = 0.0
+                
+                def _compute_bc_metrics(train_state_in, obs_batch, done_batch, action_batch):
+                    """Compute accuracy, precision, recall, F1, and confusion matrix elements"""
+                    init_h = ScannedRNN.initialize_carry(obs_batch.shape[0], config["GRU_HIDDEN_DIM"])
+                    obs_t = jnp.expand_dims(obs_batch, 0)
+                    done_t = jnp.expand_dims(done_batch, 0)
+                    _, pi = train_state_in.apply_fn(train_state_in.params, init_h, (obs_t, done_t))
+                    pred_actions = pi.mode().squeeze(0)
+                    
+                    # Accuracy
+                    accuracy = float(jnp.mean(pred_actions == action_batch))
+                    
+                    # For binary classification metrics
+                    pred_actions_np = np.asarray(pred_actions)
+                    action_batch_np = np.asarray(action_batch)
+                    
+                    # Compute TP, FP, TN, FN
+                    tp = float(np.sum((pred_actions_np == 1) & (action_batch_np == 1)))
+                    fp = float(np.sum((pred_actions_np == 1) & (action_batch_np == 0)))
+                    tn = float(np.sum((pred_actions_np == 0) & (action_batch_np == 0)))
+                    fn = float(np.sum((pred_actions_np == 0) & (action_batch_np == 1)))
+                    
+                    # Precision
+                    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                    
+                    # Recall
+                    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                    
+                    # F1 Score
+                    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+                    
+                    # Specificity
+                    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+                    
+                    return {
+                        "accuracy": accuracy,
+                        "precision": precision,
+                        "recall": recall,
+                        "f1": f1,
+                        "specificity": specificity,
+                        "tp": tp,
+                        "fp": fp,
+                        "tn": tn,
+                        "fn": fn,
+                    }
+                
                 for epoch in range(bc_epochs):
-                    perm = np.random.permutation(num_samples)
+                    perm = np.random.permutation(num_train_samples)
                     losses_this_epoch = []
-                    for start in range(0, num_samples, bc_batch_size):
+                    step_in_epoch = 0
+                    
+                    for start in range(0, num_train_samples, bc_batch_size):
                         batch_idx = perm[start:start + bc_batch_size]
-                        obs_batch = jnp.asarray(obs[batch_idx])
-                        done_batch = jnp.asarray(dones[batch_idx])
-                        action_batch = jnp.asarray(actions[batch_idx])
+                        obs_batch = jnp.asarray(obs_train[batch_idx])
+                        done_batch = jnp.asarray(dones_train[batch_idx])
+                        action_batch = jnp.asarray(actions_train[batch_idx])
                         train_state, loss = _bc_update(train_state, obs_batch, done_batch, action_batch)
-                        losses_this_epoch.append(loss)
-
-                    epoch_loss = float(jnp.mean(jnp.asarray(losses_this_epoch)))
-                    if (epoch + 1) % bc_log_every == 0:
-                        print(f"BC agent {i} epoch {epoch + 1}/{bc_epochs} loss={epoch_loss:.6f}")
+                        loss_float = float(loss)
+                        losses_this_epoch.append(loss_float)
+                        
+                        # Log every step/batch to wandb (just increment step, don't log metrics yet)
                         if config["WANDB_MODE"] != "disabled" and run is not None:
-                            wandb.log({f"bc/agent_{agent_type_names[i]}_loss": epoch_loss, "bc/epoch": epoch + 1})
-
+                            try:
+                                # Just log epoch metadata without metrics
+                                wandb.log({
+                                    f"bc/agent_{agent_type_names[i]}/epoch": epoch + 1,
+                                    f"bc/agent_{agent_type_names[i]}/step_in_epoch": step_in_epoch + 1,
+                                    "bc/global_step": global_step_for_bc,
+                                }, step=global_step_for_bc, commit=False)
+                                global_step_for_bc += 1
+                            except Exception as e:
+                                print(f"  Warning: Failed to log batch to wandb: {e}")
+                                global_step_for_bc += 1
+                        else:
+                            global_step_for_bc += 1
+                        
+                        step_in_epoch += 1
+                    
+                    epoch_loss = float(np.mean(losses_this_epoch))
+                    
+                    # Compute validation metrics every epoch
+                    val_metrics = _compute_bc_metrics(train_state, jnp.asarray(obs_val), jnp.asarray(dones_val), jnp.asarray(actions_val))
+                    
+                    # Compute price slippage metric from validation episodes
+                    price_slippage_bps = None
+                    per_step_slippage_stats = {}
+                    if len(episode_prices_slippage[i]) > 0:
+                        # Average price slippage across all episodes for this agent
+                        price_slippage_bps = float(np.mean(episode_prices_slippage[i]))
+                        
+                        # Compute per-step slippage statistics for logging
+                        for step in range(config["NUM_STEPS"]):
+                            if per_step_slippage[i][step]:
+                                step_slips = per_step_slippage[i][step]
+                                per_step_slippage_stats[step] = {
+                                    "mean": float(np.mean(step_slips)),
+                                    "std": float(np.std(step_slips)),
+                                    "min": float(np.min(step_slips)),
+                                    "max": float(np.max(step_slips)),
+                                    "count": len(step_slips),
+                                }
+                    
+                    # Log epoch summary to wandb
+                    if config["WANDB_MODE"] != "disabled" and run is not None:
+                        try:
+                            log_dict = {
+                                f"bc/agent_{agent_type_names[i]}/epoch_loss": epoch_loss,
+                                f"bc/agent_{agent_type_names[i]}/val_accuracy": val_metrics["accuracy"],
+                                f"bc/agent_{agent_type_names[i]}/val_precision": val_metrics["precision"],
+                                f"bc/agent_{agent_type_names[i]}/val_recall": val_metrics["recall"],
+                                f"bc/agent_{agent_type_names[i]}/val_f1": val_metrics["f1"],
+                                f"bc/agent_{agent_type_names[i]}/val_specificity": val_metrics["specificity"],
+                                f"bc/agent_{agent_type_names[i]}/progress": f"{epoch + 1}/{bc_epochs}",
+                                "bc/current_epoch": epoch + 1,
+                                "bc/total_bc_epochs": bc_epochs,
+                            }
+                            # Add price slippage metric if available
+                            if price_slippage_bps is not None:
+                                log_dict[f"bc/agent_{agent_type_names[i]}/price_slippage_bps"] = price_slippage_bps
+                            wandb.log(log_dict, step=global_step_for_bc, commit=True)
+                            global_step_for_bc += 1
+                        except Exception as e:
+                            print(f"  Warning: Failed to log epoch to wandb: {e}")
+                            global_step_for_bc += 1
+                    else:
+                        global_step_for_bc += 1
+                    
+                    # Console output every bc_log_every for readability
+                    if (epoch + 1) % bc_log_every == 0:
+                        slippage_str = ""
+                        if price_slippage_bps is not None:
+                            slippage_str = f" price_slippage={price_slippage_bps:.2f}bps"
+                            # Add per-step slippage summary
+                            if per_step_slippage_stats:
+                                step_means = [stats["mean"] for stats in per_step_slippage_stats.values()]
+                                step_mean_avg = float(np.mean(step_means)) if step_means else 0.0
+                                step_mean_min = float(np.min(step_means)) if step_means else 0.0
+                                step_mean_max = float(np.max(step_means)) if step_means else 0.0
+                                slippage_str += f" [per-step: avg={step_mean_avg:.2f}bps, min={step_mean_min:.2f}bps, max={step_mean_max:.2f}bps]"
+                        print(f"BC agent {i} epoch {epoch + 1}/{bc_epochs} loss={epoch_loss:.6f} val_acc={val_metrics['accuracy']:.4f} val_f1={val_metrics['f1']:.4f}{slippage_str}")
+                
                 bc_losses.append(epoch_loss)
                 train_states[i] = train_state
-
+            
+            # Save checkpoint
             checkpoint_dir = f'{config["world_config"]["alphatradePath"]}/checkpoints/MARLCheckpoints/{config["PROJECT"]}/{(run.name if run and run.name else run.id) if run else "GENERIC_RUN"}'
             orbax_checkpointer = oxcp.PyTreeCheckpointer()
             checkpoint_manager = oxcp.CheckpointManager(
@@ -781,8 +1093,27 @@ def make_train(config):
             save_args = orbax_utils.save_args_from_target(bc_ckpt)
             checkpoint_manager.save(bc_epochs, bc_ckpt, save_kwargs={"save_args": save_args})
             checkpoint_manager.wait_until_finished()
-            dataset.close()
-            print(f"BC training complete. Saved checkpoint step={bc_epochs} to {checkpoint_dir}")
+            
+            # Log final BC summary metrics to wandb
+            if config["WANDB_MODE"] != "disabled":
+                if run is not None:
+                    try:
+                        final_metrics = {
+                            "bc/total_epochs": bc_epochs,
+                            "bc/total_episodes": bc_episodes,
+                            "bc/final_loss": float(bc_losses[-1]) if bc_losses else 0.0,
+                            "bc/mean_loss": float(np.mean(bc_losses)) if bc_losses else 0.0,
+                        }
+                        wandb.log(final_metrics, commit=True)
+                        print(f"✓ Logged final BC metrics to wandb: {final_metrics}")
+                    except Exception as e:
+                        print(f"✗ Failed to log final metrics to wandb: {e}")
+                else:
+                    print(f"⚠ wandb run is None despite WANDB_MODE={config['WANDB_MODE']}")
+            else:
+                print(f"⚠ WANDB_MODE={config['WANDB_MODE']} (disabled)")
+            
+            print(f"BC training complete. Saved checkpoint to {checkpoint_dir}")
             return {"runner_state": (train_states,), "bc_losses": bc_losses}
 
         if training_mode == "rl_warm":
@@ -1251,15 +1582,54 @@ def make_train(config):
                         # Add each action count to the dictionary with a unique key
                         for a, c in zip(unique_actions, counts):
                             action_distribution[f"agent_{agent_name}/action_{int(a)}"] = c/tot_counts*100
+
+                    # Extract slippage metrics from info dict
+                    twap_slippage = None
+                    vwap_slippage = None
+                    twap_slippage_precision = None
+                    twap_slippage_recall = None
+                    vwap_slippage_precision = None
+                    vwap_slippage_recall = None
                     
+                    if 'twap_slippage' in tr.info['agent']:
+                        twap_slippage_array = np.array(tr.info['agent']['twap_slippage'])
+                        twap_slippage = float(np.mean(twap_slippage_array))
+                        # Classify slippage: 1 if below median (good), 0 if above median (bad)
+                        if len(twap_slippage_array) > 1:
+                            slippage_median = np.median(twap_slippage_array)
+                            twap_slippage_binary = (twap_slippage_array < slippage_median).astype(int)
+                            # Create dummy predictions (in a real scenario, these would come from a model)
+                            # For now, we'll create a reasonable prediction based on action
+                            if 'pred_twap_slippage' in tr.info['agent']:
+                                pred_array = np.array(tr.info['agent']['pred_twap_slippage'])
+                                pred_binary = (pred_array < slippage_median).astype(int)
+                                twap_slippage_precision, twap_slippage_recall = _compute_slippage_metrics(twap_slippage_binary, pred_binary)
+                    
+                    if 'vwap_slippage' in tr.info['agent']:
+                        vwap_slippage_array = np.array(tr.info['agent']['vwap_slippage'])
+                        vwap_slippage = float(np.mean(vwap_slippage_array))
+                        # Classify slippage: 1 if below median (good), 0 if above median (bad)
+                        if len(vwap_slippage_array) > 1:
+                            slippage_median = np.median(vwap_slippage_array)
+                            vwap_slippage_binary = (vwap_slippage_array < slippage_median).astype(int)
+                            if 'pred_vwap_slippage' in tr.info['agent']:
+                                pred_array = np.array(tr.info['agent']['pred_vwap_slippage'])
+                                pred_binary = (pred_array < slippage_median).astype(int)
+                                vwap_slippage_precision, vwap_slippage_recall = _compute_slippage_metrics(vwap_slippage_binary, pred_binary)
+
                     logging_dict = {
-                        # TODO: Log the quantities of interest. Keep it trivial for now.
                         "env_step": (metric["update_steps"]+1)
                         * config["NUM_ENVS"]
                         * config["NUM_STEPS"],
                         **{f"agent_{agent_name}/{j}": m for j, m in metric["loss"][agent_index].items()},
                         **{f"agent_{agent_name}/reward": metric["avg_reward"][agent_index]},
-                        **action_distribution
+                        **action_distribution,
+                        **({f"agent_{agent_name}/twap_slippage": twap_slippage} if twap_slippage is not None else {}),
+                        **({f"agent_{agent_name}/vwap_slippage": vwap_slippage} if vwap_slippage is not None else {}),
+                        **({f"agent_{agent_name}/twap_slippage_precision": twap_slippage_precision} if twap_slippage_precision is not None else {}),
+                        **({f"agent_{agent_name}/twap_slippage_recall": twap_slippage_recall} if twap_slippage_recall is not None else {}),
+                        **({f"agent_{agent_name}/vwap_slippage_precision": vwap_slippage_precision} if vwap_slippage_precision is not None else {}),
+                        **({f"agent_{agent_name}/vwap_slippage_recall": vwap_slippage_recall} if vwap_slippage_recall is not None else {}),
                     }
                 
                     
@@ -1437,8 +1807,10 @@ def main(config):
         env_config=MultiAgentConfig()
         save_config_to_file(env_config,f"config/env_configs/default_config_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
     print("Note: The sweep parameters in yaml will override these settings.")
-    env_config=OmegaConf.structured(env_config)
-    final_config=OmegaConf.merge(config,env_config)
+    env_config = OmegaConf.create(
+        OmegaConf.to_container(OmegaConf.structured(env_config), resolve=True)
+    )
+    final_config=OmegaConf.merge(env_config, config)
     config = OmegaConf.to_container(final_config)
 
 

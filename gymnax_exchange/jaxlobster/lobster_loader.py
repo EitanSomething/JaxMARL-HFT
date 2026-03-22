@@ -659,6 +659,12 @@ class LoadLOBSTER_resample():
         else:
 
             results = self._load_files()
+            if len(results) == 0:
+                raise ValueError(
+                    "No valid LOBSTER file pairs were loaded. "
+                    "Check world_config.dataPath/stock/timePeriod and ensure book_depth matches the orderbook CSV columns "
+                    "(expected columns = book_depth * 4)."
+                )
             # Sort results by file_index (last element of tuple) to maintain file order
             results.sort(key=lambda x: x[-1])
             

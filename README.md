@@ -103,11 +103,13 @@ cd /home/eitant/Documents/School/ML-Capstone/JaxMARL-HFT
 Then run one of the following commands:
 
 ```bash
-# 1) Behavior cloning from offline demonstrations (.npz)
+# 1) Behavior cloning from in-memory expert demonstrations (TWAP/VWAP)
 python3 gymnax_exchange/jaxrl/MARL/ippo_rnn_JAXMARL.py \
   --config-name="ippo_rnn_JAXMARL_exec" \
   TRAINING_MODE="bc" \
-  BC_DATA_PATH="/absolute/path/to/demos.npz"
+  +EXPERT_POLICY="vwap" \
+  WANDB_MODE="online" \
+  ENTITY="<your-wandb-entity>"
 
 # 2) RL warm start from a BC checkpoint directory
 python3 gymnax_exchange/jaxrl/MARL/ippo_rnn_JAXMARL.py \
@@ -121,18 +123,14 @@ python3 gymnax_exchange/jaxrl/MARL/ippo_rnn_JAXMARL.py \
   TRAINING_MODE="rl_cold"
 ```
 
+**Note on Behavior Cloning (`bc` mode):**
+The pipeline utilizes an automated in-memory rollout generator (`bc_dataset_generator.py`) to synthesize demonstration data. You do not need to provide a `.npz` or `.csv` file. Simply pass the `+EXPERT_POLICY` flag (either `"vwap"` or `"twap"`) using standard [Hydra syntax](https://hydra.cc/docs/advanced/override_grammar/basic/) to determine the heuristic the model clones!
+
 Common errors:
 
-- `ENTITY` left as `your-wandb-entity`
-- `TRAINING_MODE="bc"` but `BC_DATA_PATH` is null
-- `TRAINING_MODE="rl_warm"` with no `WARMSTART_*` source configured
-
-Expected BC dataset keys in `.npz`:
-
-- Single-agent: `obs`, `actions`, optional `dones`
-- Multi-agent type: `obs_0`, `actions_0`, optional `dones_0`, `obs_1`, ...
-
-Shapes should be either `[N, T, ...]` or `[N, ...]` (single-step is expanded to `T=1`).
+- `ENTITY` left as `your-wandb-entity` yielding a `404` upload error in WandB.
+- `TRAINING_MODE="rl_warm"` with no `WARMSTART_*` source configured.
+- Omitting the `+` prefix before `EXPERT_POLICY` (Hydra requires `+EXPERT_POLICY=vwap` to append runtime variables).
 
 ### 5. WandB (optional)
 

@@ -1,80 +1,6 @@
-"""
-Execution Environment for Limit Order Book  with variable start time for episodes. 
-
-University of Oxford
-Corresponding Author: 
-Kang Li     (kang.li@keble.ox.ac.uk)
-Sascha Frey (sascha.frey@st-hughs.ox.ac.uk)
-Peer Nagy   (peer.nagy@reuben.ox.ac.uk)
-V1.0 
-
-
-
-
-Module Description
-This module extends the base simulation environment for limit order books 
- using JAX for high-performance computations, specifically tailored for 
- execution tasks in financial markets. It is particularly designed for 
- reinforcement learning applications focusing on 
- optimal trade execution strategies.
-
-Key Components
-ExecEnvState:   Dataclass to encapsulate the current state of the environment, 
-            including the raw order book, trades, and time information.
-ExecEnvParams:  Configuration class for environment-specific parameters, 
-            such as task details, message and book data, and episode timing.
-ExecutionAgent: Environment class inheriting from BaseLOBEnv, 
-              offering specialized methods for order placement and 
-              execution tasks in trading environments. 
-
-
-Functionality Overview
-__init__:           Initializes the execution environment, setting up paths 
-                    for data, action types, and task details. 
-                    It includes pre-processing and initialization steps 
-                    specific to execution tasks.
-default_params:     Returns the default parameters for execution environment,
-                    adjusting for tasks such as buying or selling.
-step_env:           Advances the environment by processing actions and market 
-                    messages. It updates the state and computes the reward and 
-                    termination condition based on execution-specific criteria.
-reset_env:          Resets the environment to a state appropriate for a new 
-                    execution task. Initializes the order book and sets initial
-                    state specific to the execution context.
-is_terminal:        Checks whether the current state is terminal, based on 
-                    the number of steps executed or tasks completed.
-
-action_space:       Defines the action space for execution tasks, including 
-                    order types and quantities.
-observation_space:  Define the observation space for execution tasks.
-
-state_space:        Describes the state space of the environment, tailored 
-                    for execution tasks with components 
-                    like bids, asks, and trades.
-reset_env:          Resets the environment to a specific state for execution. 
-                    It selects a new data window, initializes the order book, 
-                    and sets the initial state for execution tasks.
-_getActionMsgs:      Generates action messages based on 
-                    the current state and action. 
-                    It determines the type, side, quantity, 
-                    and price of orders to be executed.
-                    including detailed order book information and trade history
-_get_obs:           Constructs and returns the current observation for the 
-                    execution environment, derived from the state.
-_get_state_from_data:
-_reshape_action:
-_best_prices_impute
-_get_reward:
-name, num_actions:  Inherited methods providing the name of the environment 
-                    and the number of possible actions.
-
-
-                
-_get_data_messages: Inherited method to fetch market messages for a given 
-                    step from all available messages.
-"""
-
-# from jax import config
+# =============================================================================
+# Execution Environment for JaxMARL-HFT
+# =============================================================================
 # config.update("jax_enable_x64",True)
 # ============== testing scripts ===============
 import os
@@ -171,6 +97,8 @@ class ExecutionAgent():
             self.action_fn = self._getActionMsgs_fixedQuant_1msg
         elif self.cfg.action_space == "twap":
             self.action_fn = self._getActionMsgs_twap
+        elif self.cfg.action_space == "vwap":
+            self.action_fn = self._getActionMsgs_vwap
         elif self.cfg.action_space == "execute_hold":
             self.action_fn = self._getActionMsgs_executeHold
         else:
@@ -218,7 +146,7 @@ class ExecutionAgent():
             world_state: WorldState,
             num_msgs_per_step: int # Useful for message based obs space if we will implement that for exec aswell
         ) -> Tuple[chex.Array, ExecEnvState]:
-        """ Reset the agent specific environment state"""
+        # Reset the agent specific environment state
 
 
         if self.cfg.task == 'random':
@@ -1257,6 +1185,169 @@ class ExecutionAgent():
 
         #jax.debug.print("action_msgs exec: {}", action_msgs)
         return action_msgs , {}
+
+    def _getActionMsgs_vwap(self, action: jax.Array, world_state: WorldState, agent_state: ExecEnvState, agent_params: ExecEnvParams):
+        """
+        VWAP-style action function from CPU version.
+
+        The agent follows a pre-defined intraday volume profile (U-shaped curve),
+        and executes trades to match the cumulative target implied by that profile.
+
+        The RL policy does NOT decide how much to trade — that is determined
+        by the schedule. Instead, it decides HOW to execute the slice:
+
+            action = 0 → execute aggressively (far touch)
+            action = 1 → execute passively (near touch)
+
+        This mirrors real-world execution algorithms:
+            schedule (VWAP) + learned execution strategy (RL).
+        """
+
+        # ============================================================
+        # 1) Compute progress through the episode
+        # ============================================================
+
+        # Use step-based progress (robust to irregular event timing)
+        progress = jnp.clip(
+            world_state.step_counter / jnp.maximum(world_state.max_steps_in_episode, 1),
+            0.0,
+            1.0 - 1e-6
+        )
+
+        # ============================================================
+        # 2) Define intraday volume profile (VWAP curve)
+        # ============================================================
+
+        # U-shaped volume curve: high volume at open/close, low mid-day
+        volume_schedule = jnp.array([
+            0.14, 0.11, 0.09, 0.08, 0.08,
+            0.08, 0.08, 0.09, 0.11, 0.14
+        ], dtype=jnp.float32)
+
+        # Ensure schedule sums to 1.0 (defensive programming)
+        volume_schedule = volume_schedule / jnp.sum(volume_schedule)
+
+        n_buckets = volume_schedule.shape[0]
+
+        # Map progress ∈ [0,1) → bucket index
+        current_bucket = jnp.floor(progress * n_buckets).astype(jnp.int32)
+
+        # ============================================================
+        # 3) Compute cumulative VWAP target
+        # ============================================================
+
+        # Cumulative fraction of volume up to current bucket
+        cumulative_schedule = jnp.cumsum(volume_schedule)
+
+        # Target number of shares that SHOULD have been executed by now
+        target_executed = jnp.floor(
+            agent_state.task_to_execute * cumulative_schedule[current_bucket]
+        ).astype(jnp.int32)
+
+        # Remaining shares left to execute
+        remaining = jnp.maximum(
+            agent_state.task_to_execute - agent_state.quant_executed,
+            0
+        )
+
+        # ============================================================
+        # 4) Compute how much to trade this step
+        # ============================================================
+
+        # Key idea:
+        # Trade just enough to "catch up" to the VWAP schedule
+
+        quant_this_step = jnp.minimum(
+            jnp.maximum(target_executed - agent_state.quant_executed, 0),
+            remaining
+        ).astype(jnp.int32)
+
+        # ============================================================
+        # 5) Determine execution prices (same as TWAP logic)
+        # ============================================================
+
+        # Round prices to valid tick levels
+        best_ask = jnp.int32(
+            (world_state.best_asks[-1][0] // self.world_config.tick_size)
+            * self.world_config.tick_size
+        )
+        best_bid = jnp.int32(
+            (world_state.best_bids[-1][0] // self.world_config.tick_size)
+            * self.world_config.tick_size
+        )
+
+        # Price selection depends on buy vs sell task
+        def buy_task_prices(best_ask, best_bid):
+            # Buy aggressively at ask, passively at bid
+            return best_ask, best_bid  # (far_touch, near_touch)
+
+        def sell_task_prices(best_ask, best_bid):
+            # Sell aggressively at bid, passively at ask
+            return best_bid, best_ask  # (far_touch, near_touch)
+
+        price_levels = jax.lax.cond(
+            agent_state.is_sell_task,
+            sell_task_prices,
+            buy_task_prices,
+            best_ask, best_bid
+        )
+
+        # ============================================================
+        # 6) Map action → quantity distribution
+        # ============================================================
+
+        # Two-action policy:
+        # action 0 → all quantity at far touch (aggressive)
+        # action 1 → all quantity at near touch (passive)
+        quant_array = jnp.array([
+            [1, 0],  # aggressive
+            [0, 1],  # passive
+        ], dtype=jnp.int32)
+
+        # Select quantity split based on action
+        quants = (quant_array[action, :] * quant_this_step).flatten().astype(jnp.int32)
+
+        # ============================================================
+        # 7) Build action messages for the exchange simulator
+        # ============================================================
+
+        n = self.cfg.num_action_messages_by_agent
+
+        # Order types (1 = limit order)
+        types = jnp.ones((n,), jnp.int32)
+
+        # Side: +1 for buy, -1 for sell
+        sides = (1 - agent_state.is_sell_task * 2) * jnp.ones((n,), jnp.int32)
+
+        # Assign trader ID
+        trader_ids = jnp.ones((n,), jnp.int32) * agent_params.trader_id
+
+        # Placeholder order IDs (will be filled downstream)
+        order_ids = jnp.full((n,), self.world_config.placeholder_order_id, dtype=jnp.int32)
+
+        # Time stamps (with optional delay)
+        times = jnp.resize(
+            world_state.time + self.cfg.time_delay_obs_act,
+            (n, 2)
+        )
+
+        # Convert price tuple to array
+        price_levels_arr = jnp.array(price_levels, ndmin=1)
+
+        # Stack into message format expected by simulator
+        action_msgs = jnp.stack(
+            [types, sides, quants, price_levels_arr, order_ids, trader_ids],
+            axis=1
+        )
+
+        # Append time information
+        action_msgs = jnp.concatenate([action_msgs, times], axis=1)
+
+        # ============================================================
+        # 8) Return messages
+        # ============================================================
+
+        return action_msgs, {}
 
 
 
