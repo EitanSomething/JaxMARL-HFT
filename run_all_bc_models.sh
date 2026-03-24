@@ -1,0 +1,92 @@
+#!/bin/bash
+
+# Run all 8 BC architecture combinations with stratified train/test split
+# Architectures: rnn_base, rnn_wide, rnn_deep, transformer
+# Policies: vwap, twap
+
+cd /home/eitant/Documents/School/ML-Capstone/JaxMARL-HFT
+export PYTHONPATH="$(pwd):$PYTHONPATH"
+
+PYTHON=/home/eitant/Documents/School/ML-Capstone/.venv/bin/python
+
+# Arrays of architectures and policies
+ARCHITECTURES=("rnn" "rnn_wide" "rnn_deep" "transformer")
+POLICIES=("vwap" "twap")
+
+# Counter for tracking
+TOTAL=0
+CURRENT=0
+
+# Calculate total runs
+for arch in "${ARCHITECTURES[@]}"; do
+  for policy in "${POLICIES[@]}"; do
+    TOTAL=$((TOTAL + 1))
+  done
+done
+
+echo "Running $TOTAL BC training combinations with stratified splits..."
+echo "=================================================="
+
+# Run all combinations
+for arch in "${ARCHITECTURES[@]}"; do
+  for policy in "${POLICIES[@]}"; do
+    CURRENT=$((CURRENT + 1))
+    echo ""
+    echo "[$CURRENT/$TOTAL] Starting: Architecture=$arch, Policy=$policy"
+    echo "=================================================="
+    
+    # Build architecture-specific parameters
+    ARCH_PARAMS=""
+    if [ "$arch" = "rnn_wide" ]; then
+      ARCH_PARAMS="++WIDE_FACTOR=2"
+    elif [ "$arch" = "rnn_deep" ]; then
+      ARCH_PARAMS="++DEEP_LAYERS=3"
+    elif [ "$arch" = "transformer" ]; then
+      ARCH_PARAMS="++TRANSFORMER_MODEL_DIM=128 ++TRANSFORMER_NUM_LAYERS=2 ++TRANSFORMER_NUM_HEADS=4 ++TRANSFORMER_MLP_DIM=256"
+    fi
+    
+    # Create run name
+    RUN_NAME="bc-${arch}-${policy}"
+    
+    # Run training
+    XLA_PYTHON_CLIENT_ALLOCATOR=platform \
+    XLA_PYTHON_CLIENT_MEM_FRACTION=0.90 \
+    $PYTHON gymnax_exchange/jaxrl/MARL/ippo_rnn_JAXMARL.py \
+      --config-name=ippo_rnn_JAXMARL_exec \
+      TRAINING_MODE=bc \
+      +EXPERT_POLICY=$policy \
+      ARCHITECTURE=$arch \
+      $ARCH_PARAMS \
+      WANDB_MODE=online \
+      ENTITY=eitansomething-n-a \
+      PROJECT=BC-Comparison-Apple \
+      +wandb.name=$RUN_NAME-AAPL-MultiYear \
+      TimePeriod=\'2012,2019,2020,2021\' \
+      EvalTimePeriod=\'2012,2019,2020,2021\' \
+      SWEEP_PARAMETERS=null \
+      ++BC_EPISODES=16 \
+      ++BC_EPOCHS=20 \
+      ++BC_BATCH_SIZE=32 \
+      ++NUM_ENVS=8 \
+      ++NUM_STEPS=8 \
+      ++GRU_HIDDEN_DIM=128 \
+      ++FC_DIM_SIZE=128 \
+      +world_config.alphatradePath=/home/eitant/Documents/School/ML-Capstone/JaxMARL-HFT \
+      +world_config.dataPath=/home/eitant/Documents/School/ML-Capstone/data \
+      +world_config.stock=AAPL \
+      +world_config.timePeriod=\'2012,2019,2020,2021\' \
+      +world_config.book_depth=5
+    
+    STATUS=$?
+    if [ $STATUS -ne 0 ]; then
+      echo "⚠ Run [$CURRENT/$TOTAL] failed with status $STATUS"
+    else
+      echo "✓ Run [$CURRENT/$TOTAL] completed successfully"
+    fi
+  done
+done
+
+echo ""
+echo "=================================================="
+echo "All $TOTAL BC training runs completed!"
+echo "Metrics saved to W&B project: BC-Comparison"

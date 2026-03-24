@@ -1086,105 +1086,47 @@ class ExecutionAgent():
 
 
     def _getActionMsgs_twap(self, action: jax.Array, world_state : WorldState, agent_state: ExecEnvState, agent_params: ExecEnvParams):
-        """Action function for the twap baseline action space
-            For now, assume only one possible action. 
-            Can expand later to allow for flavours of twap, or parametrised twap. 
-        0 = Execute TWAP Strategy with Aggressive Price (FT)
-        1 = Execute TWAP Strategy with Passive Price (NT)
-       """
+        """Binary TWAP action space: 0=HOLD, 1=EXECUTE at far touch (aggressive price).
+        
+        Time-weighted execution: divide remaining quantity evenly across remaining steps.
+        When executing, always trade at the far touch for consistency with VWAP expert.
+        """
 
-        def quant_callback(x,steps):
-            if x < 0 or steps<=0:
-                print(f"quant this step: {x}")
-                print(f"steps left: {steps}")
-            return x
-        #calculate % time (steps) remaining in the episode 
-        # Calculate % time or steps remaining in the episode 
         if self.world_config.ep_type == 'fixed_time':
             raise NotImplementedError("TWAP not implemented for fixed time episodes, need to have some notion of delta_time per step.")
         elif self.world_config.ep_type == 'fixed_steps':
-            # Calculate remaining steps as a percentage
-            steps_left=world_state.max_steps_in_episode - world_state.step_counter-1
+            # Calculate remaining steps and divide quantity evenly
+            steps_left = world_state.max_steps_in_episode - world_state.step_counter - 1
             quant_left = jnp.maximum(agent_state.task_to_execute - agent_state.quant_executed, 0)
-            quant_this_step= jnp.ceil(quant_left / steps_left).astype(jnp.int32)  # quant to execute this step
-            # jax.debug.callback(quant_callback, quant_this_step,steps_left)
-        # Get the quants based on the action
+            quant_this_step = jnp.ceil(quant_left / steps_left).astype(jnp.int32)
 
-
-        #----01 get price levels----#
+        # Get best bid/ask prices
         best_ask = jnp.int32((world_state.best_asks[-1][0] // self.world_config.tick_size) * self.world_config.tick_size)
         best_bid = jnp.int32((world_state.best_bids[-1][0] // self.world_config.tick_size) * self.world_config.tick_size)
-        #jax.debug.print('best_ask: {}, best_bid: {}', best_ask, best_bid)
 
-        def buy_task_prices(best_ask, best_bid):
-            FT = best_ask
-            # mid defaults to one tick more passive if between ticks
-            M = ((best_bid + best_ask) // 2 // self.world_config.tick_size) * self.world_config.tick_size
-            NT = best_bid
-            PP = best_bid - self.world_config.tick_size*self.cfg.n_ticks_in_book
-            return FT, NT
-        def sell_task_prices(best_ask, best_bid):
-            FT = best_bid
-            # mid defaults to one tick more passive if between ticks
-            M = (jnp.ceil((best_bid + best_ask) / 2 // self.world_config.tick_size)
-                 * self.world_config.tick_size).astype(jnp.int32)
-            NT = best_ask
-            PP = best_ask + self.world_config.tick_size*self.cfg.n_ticks_in_book
-            return FT, NT
-        
-        price_levels = jax.lax.cond(
+        # Far touch price (aggressive): ask for buy, bid for sell
+        ft_price = jax.lax.cond(
             agent_state.is_sell_task,
-            sell_task_prices,
-            buy_task_prices,
-            best_ask, best_bid
+            lambda: best_bid,
+            lambda: best_ask,
         )
 
-        quant_array = jnp.array([
-                [1, 0],  # FT
-                [0, 1],  # NT
-            ])
-
-
-
-        quants=quant_array[action,:]*quant_this_step
-
-
-
-        quants = quants.flatten() #Flatten the array to 1D
-        #----03 get the rest of the message----#
-        types = jnp.ones((self.cfg.num_action_messages_by_agent,), jnp.int32)
-        sides = (1 - agent_state.is_sell_task*2) * jnp.ones((self.cfg.num_action_messages_by_agent,), jnp.int32)
-        trader_ids = jnp.ones((self.cfg.num_action_messages_by_agent,), jnp.int32) * agent_params.trader_id #This agent will always have the same (unique) trader ID
-        # Placeholder for order ids
-        order_ids = jnp.full((self.cfg.num_action_messages_by_agent,), self.world_config.placeholder_order_id, dtype=jnp.int32)
-        times = jnp.resize(
-            world_state.time + self.cfg.time_delay_obs_act,
-            (self.cfg.num_action_messages_by_agent, 2)#4 trades, 2 times
-        )
-
-
-        #jax.debug.print("quants:{}",quants)
-        #jax.debug.print("quants left:{}",quant_left)
-        #jax.debug.print("total quant:{}",total_quant)
-        #jax.debug.print("quant_array of 0:{}",quant_array[0,:])
-        #jax.debug.print("quant_array of 0:{}",quant_array[1,:])
-
-
-        #--make arrays--#
-        quants=jnp.array(quants)
-        #jax.debug.print("quants:{}",quants)
-        price_levels=jnp.array(price_levels,ndmin=1)
-
-        #---form messages---#
-
-        # print([types, sides, quants, price_levels, order_ids,trader_ids])
-        action_msgs = jnp.stack([types, sides, quants, price_levels, order_ids,trader_ids], axis=1)
-        action_msgs = jnp.concatenate([action_msgs, times],axis=1)
-
-        # jax.debug.print("action_msgs exec twap: \n  {}", action_msgs)
-
-        #jax.debug.print("action_msgs exec: {}", action_msgs)
-        return action_msgs , {}
+        # Execute full quant_this_step if action=1, else 0
+        quant = jnp.where(action == 1, quant_this_step, 0).astype(jnp.int32)
+        # Build message (single trade if executing, zero-quant if holding)
+        types = jnp.ones((1,), jnp.int32)
+        sides = (1 - agent_state.is_sell_task * 2) * jnp.ones((1,), jnp.int32)
+        trader_ids = jnp.ones((1,), jnp.int32) * agent_params.trader_id
+        order_ids = jnp.full((1,), self.world_config.placeholder_order_id, dtype=jnp.int32)
+        times = jnp.resize(world_state.time + self.cfg.time_delay_obs_act, (1, 2))
+        
+        quants = jnp.array([quant])
+        prices = jnp.array([ft_price])
+        
+        action_msgs = jnp.stack([types, sides, quants, prices, order_ids, trader_ids], axis=1)
+        action_msgs = jnp.concatenate([action_msgs, times], axis=1)
+        
+        return action_msgs, {}
 
     def _getActionMsgs_vwap(self, action: jax.Array, world_state: WorldState, agent_state: ExecEnvState, agent_params: ExecEnvParams):
         """
@@ -1811,7 +1753,9 @@ class ExecutionAgent():
 
         price_advantage = advantage / (agentQuant + 1e-9)  # avoid div by zero, only applies if adv=0
         price_drift = drift/(agentQuant + 1e-9)
-        slippage = ( advantage + drift ) #/ (agentQuant + 1e-9) # lambda = 1 case
+        # Slippage measures deviation from market VWAP benchmark (per DNN/jaxlob formula)
+        # NOT deviation from initial price. This makes VWAP vs TWAP comparison meaningful.
+        slippage = price_advantage  # = advantage / (agentQuant + 1e-9)
         
         
         # ---------- Rolling Means of Key Values ----------

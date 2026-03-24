@@ -979,54 +979,57 @@ def make_train(config):
                         "tn": tn,
                         "fn": fn,
                     }
+
+            # Setup pure JAX evaluation function for actual model slippage
+            def _bc_eval_step(eval_runner_state, unused):
+                train_states_eval, eval_env_state, last_obs, last_done, h_states, eval_rng = eval_runner_state
+                actions = []
+                new_h_states = []
+                for i_ag, train_state_eval in enumerate(train_states_eval):
+                    obs_i = batchify(last_obs[i_ag], config["NUM_ACTORS_PERTYPE"][i_ag])
+                    ac_in = (obs_i[jnp.newaxis, :], last_done[i_ag][jnp.newaxis, :])
+                    h, pi = train_state_eval.apply_fn(train_state_eval.params, h_states[i_ag], ac_in)
+                    action = pi.mode().squeeze(0)
+                    action_unbatched = unbatchify(action, config["NUM_ENVS"], env.multi_agent_config.number_of_agents_per_type[i_ag])
+                    actions.append(action_unbatched.squeeze())
+                    new_h_states.append(h)
+                    
+                eval_rng, _rng = jax.random.split(eval_rng)
+                rng_step = jax.random.split(_rng, config["NUM_ENVS"])
                 
+                obsv, eval_env_state, reward, done, info = jax.vmap(
+                    env.step, in_axes=(0, 0, 0, None)
+                )(rng_step, eval_env_state, actions, env_params)
+                
+                done_batch = []
+                for i_ag in range(len(train_states_eval)):
+                    d = batchify(done["agents"][i_ag], config["NUM_ACTORS_PERTYPE"][i_ag])
+                    done_batch.append(jnp.squeeze(d))
+                
+                step_info = []
+                for i_ag in range(len(train_states_eval)):
+                    step_info.append(info["agents"][i_ag].get("adj_slippage_bps", jnp.zeros_like(reward[i_ag])))
+                
+                new_runner_state = (train_states_eval, eval_env_state, obsv, done_batch, new_h_states, eval_rng)
+                return new_runner_state, step_info
 
-                # Evaluate the actual cloned model slippage natively
-                def _bc_eval_step(eval_runner_state, unused):
-                    train_states_eval, eval_env_state, last_obs, last_done, h_states, eval_rng = eval_runner_state
-                    eval_actions = []
-                    new_h_states = []
-                    for i_ag, train_state_eval in enumerate(train_states_eval):
-                        obs_i = batchify(last_obs[i_ag], config["NUM_ACTORS_PERTYPE"][i_ag])
-                        ac_in = (obs_i[jnp.newaxis, :], last_done[i_ag][jnp.newaxis, :])
-                        h, pi = train_state_eval.apply_fn(train_state_eval.params, h_states[i_ag], ac_in)
-                        action_sample = pi.mode().squeeze(0)
-                        action_unbatched = unbatchify(action_sample, config["NUM_ENVS"], env.multi_agent_config.number_of_agents_per_type[i_ag])
-                        eval_actions.append(action_unbatched.squeeze())
-                        new_h_states.append(h)
-                        
-                    eval_rng, _rng_step = jax.random.split(eval_rng)
-                    rng_step = jax.random.split(_rng_step, config["NUM_ENVS"])
+            @jax.jit
+            def _run_model_eval(train_states_current, eval_rng):
+                eval_rng, reset_rng_key = jax.random.split(eval_rng)
+                reset_rng = jax.random.split(reset_rng_key, config["NUM_ENVS"])
+                eval_obsv, eval_env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
+                
+                eval_hstates = []
+                init_dones_agents_eval = []
+                for i_ag in range(len(train_states_current)):
+                    eval_hstates.append(ScannedRNN.initialize_carry(config["NUM_ACTORS_PERTYPE"][i_ag], config["GRU_HIDDEN_DIM"]))
+                    init_dones_agents_eval.append(jnp.zeros((config["NUM_ACTORS_PERTYPE"][i_ag]), dtype=bool))
                     
-                    obsv_step, eval_env_state_step, reward_step, done_step, info_step = jax.vmap(
-                        env.step, in_axes=(0, 0, 0, None)
-                    )(rng_step, eval_env_state, eval_actions, env_params)
-                    
-                    done_batch_step = []
-                    step_info = []
-                    for i_ag in range(len(train_states_eval)):
-                        d = batchify(done_step["agents"][i_ag], config["NUM_ACTORS_PERTYPE"][i_ag])
-                        done_batch_step.append(jnp.squeeze(d))
-                        step_info.append(info_step["agents"][i_ag].get("adj_slippage_bps", jnp.zeros_like(reward_step[i_ag])))
-                        
-                    new_runner_state = (train_states_eval, eval_env_state_step, obsv_step, done_batch_step, new_h_states, eval_rng)
-                    return new_runner_state, step_info
+                eval_runner_state_init = (train_states_current, eval_env_state, eval_obsv, init_dones_agents_eval, eval_hstates, eval_rng)
+                _, eval_slippage_traj = jax.lax.scan(_bc_eval_step, eval_runner_state_init, None, config["NUM_STEPS"])
+                return eval_slippage_traj
 
-                @jax.jit
-                def _run_model_eval(train_states_current, eval_rng_in):
-                    eval_rng_in, reset_rng_key = jax.random.split(eval_rng_in)
-                    reset_rng = jax.random.split(reset_rng_key, config["NUM_ENVS"])
-                    eval_obsv, eval_env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
-                    
-                    eval_hstates = []
-                    init_dones_agents_eval = []
-                    for i_ag in range(len(train_states_current)):
-                        eval_hstates.append(ScannedRNN.initialize_carry(config["NUM_ACTORS_PERTYPE"][i_ag], config["GRU_HIDDEN_DIM"]))
-                        init_dones_agents_eval.append(jnp.zeros((config["NUM_ACTORS_PERTYPE"][i_ag]), dtype=bool))
-                        
-                    eval_runner_state_init = (train_states_current, eval_env_state, eval_obsv, init_dones_agents_eval, eval_hstates, eval_rng_in)
-                    _, eval_slippage_traj = jax.lax.scan(_bc_eval_step, eval_runner_state_init, None, config["NUM_STEPS"])
-                    return eval_slippage_traj
+                
                 for epoch in range(bc_epochs):
                     perm = np.random.permutation(num_train_samples)
                     losses_this_epoch = []
@@ -1061,9 +1064,8 @@ def make_train(config):
                     
                     epoch_loss = float(np.mean(losses_this_epoch))
 
-                    # Capture actual models behaviour slippage natively.
+                    # Evaluate ACTUAL model execution slippage
                     rng, _run_eval_rng = jax.random.split(rng)
-                    train_states[i] = train_state
                     eval_slippage_traj = _run_model_eval(train_states, _run_eval_rng)
                     
                     true_model_slippage_bps = None

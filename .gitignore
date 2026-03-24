@@ -3,6 +3,7 @@
 **.pyc
 __pycache__/
 config/env_configs/default_config_*.json
+results/
 .idea/**
 .spyproject/**
 .DS_Store
