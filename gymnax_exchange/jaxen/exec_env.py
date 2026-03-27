@@ -108,6 +108,8 @@ class ExecutionAgent():
         #Choose observation space based on config.
         if self.cfg.observation_space == "engineered":
             self.observation_fn = self._get_obs
+        elif self.cfg.observation_space == "engineered_with_obi":
+            self.observation_fn = self._get_obs_with_obi
         elif self.cfg.observation_space == "basic":
             self.observation_fn = self._get_obs_basic
         elif self.cfg.observation_space == "simplest_case":
@@ -1136,13 +1138,12 @@ class ExecutionAgent():
         and executes trades to match the cumulative target implied by that profile.
 
         The RL policy does NOT decide how much to trade — that is determined
-        by the schedule. Instead, it decides HOW to execute the slice:
+        by the schedule. Instead, it decides whether to execute the slice now or hold:
 
-            action = 0 → execute aggressively (far touch)
-            action = 1 → execute passively (near touch)
+            action = 0 → HOLD
+            action = 1 → EXECUTE at far touch (aggressive)
 
-        This mirrors real-world execution algorithms:
-            schedule (VWAP) + learned execution strategy (RL).
+        This mirrors the DNN baseline logic.
         """
 
         # ============================================================
@@ -1218,67 +1219,48 @@ class ExecutionAgent():
             * self.world_config.tick_size
         )
 
-        # Price selection depends on buy vs sell task
-        def buy_task_prices(best_ask, best_bid):
-            # Buy aggressively at ask, passively at bid
-            return best_ask, best_bid  # (far_touch, near_touch)
-
-        def sell_task_prices(best_ask, best_bid):
-            # Sell aggressively at bid, passively at ask
-            return best_bid, best_ask  # (far_touch, near_touch)
-
-        price_levels = jax.lax.cond(
+        # Far touch price (aggressive): ask for buy, bid for sell
+        ft_price = jax.lax.cond(
             agent_state.is_sell_task,
-            sell_task_prices,
-            buy_task_prices,
-            best_ask, best_bid
+            lambda: best_bid,
+            lambda: best_ask,
         )
 
         # ============================================================
         # 6) Map action → quantity distribution
         # ============================================================
 
-        # Two-action policy:
-        # action 0 → all quantity at far touch (aggressive)
-        # action 1 → all quantity at near touch (passive)
-        quant_array = jnp.array([
-            [1, 0],  # aggressive
-            [0, 1],  # passive
-        ], dtype=jnp.int32)
-
-        # Select quantity split based on action
-        quants = (quant_array[action, :] * quant_this_step).flatten().astype(jnp.int32)
+        # Binary VWAP action space: 0=HOLD, 1=EXECUTE at far touch
+        quant = jnp.where(action == 1, quant_this_step, 0).astype(jnp.int32)
 
         # ============================================================
         # 7) Build action messages for the exchange simulator
         # ============================================================
 
-        n = self.cfg.num_action_messages_by_agent
-
-        # Order types (1 = limit order)
-        types = jnp.ones((n,), jnp.int32)
+        # Build message (single trade if executing, zero-quant if holding)
+        types = jnp.ones((1,), jnp.int32)
 
         # Side: +1 for buy, -1 for sell
-        sides = (1 - agent_state.is_sell_task * 2) * jnp.ones((n,), jnp.int32)
+        sides = (1 - agent_state.is_sell_task * 2) * jnp.ones((1,), jnp.int32)
 
         # Assign trader ID
-        trader_ids = jnp.ones((n,), jnp.int32) * agent_params.trader_id
+        trader_ids = jnp.ones((1,), jnp.int32) * agent_params.trader_id
 
         # Placeholder order IDs (will be filled downstream)
-        order_ids = jnp.full((n,), self.world_config.placeholder_order_id, dtype=jnp.int32)
+        order_ids = jnp.full((1,), self.world_config.placeholder_order_id, dtype=jnp.int32)
 
         # Time stamps (with optional delay)
         times = jnp.resize(
             world_state.time + self.cfg.time_delay_obs_act,
-            (n, 2)
+            (1, 2)
         )
 
-        # Convert price tuple to array
-        price_levels_arr = jnp.array(price_levels, ndmin=1)
+        quants = jnp.array([quant])
+        prices = jnp.array([ft_price])
 
         # Stack into message format expected by simulator
         action_msgs = jnp.stack(
-            [types, sides, quants, price_levels_arr, order_ids, trader_ids],
+            [types, sides, quants, prices, order_ids, trader_ids],
             axis=1
         )
 
@@ -1384,6 +1366,11 @@ class ExecutionAgent():
         Wrapper function to call the appropriate observation function.
         """
         if self.cfg.observation_space == "engineered":
+            return self.observation_fn(world_state=world_state, 
+                                       agent_state=agent_state, 
+                                       normalize=normalize,
+                                       flatten=flatten)
+        elif self.cfg.observation_space == "engineered_with_obi":
             return self.observation_fn(world_state=world_state, 
                                        agent_state=agent_state, 
                                        normalize=normalize,
@@ -2165,7 +2152,7 @@ class ExecutionAgent():
                 "task_size": self.cfg.task_size,
                 "executed_quant": self.cfg.task_size,
                 "remaining_quant": self.cfg.task_size,
-                "step_counter": 30,  # TODO: find way to make this dependent on episode length
+                "step_counter": max(self.world_config.episode_time, 1),  # Dynamic: scale by actual episode length (64 for fixed_steps)
                 "remaining_ratio": 1,
             }
         # print("obs:", obs)
@@ -2182,10 +2169,173 @@ class ExecutionAgent():
 
         return obs
 
+    def _get_obs_with_obi(
+            self,
+            agent_state: ExecEnvState,
+            world_state: WorldState,
+            normalize: bool,
+            flatten: bool = True,
+        ) -> chex.Array:
+        """Return observation with Order Book Imbalance (OBI) added - 13 features total."""
+        
+        # Get base observation (12 features)
+        quote_aggr, quote_pass = jax.lax.cond(
+            agent_state.is_sell_task,
+            lambda: (world_state.best_bids[-1], world_state.best_asks[-1]),
+            lambda: (world_state.best_asks[-1], world_state.best_bids[-1]),
+        )
+        bid_vol_tot = job.get_volume(world_state.bid_raw_orders)
+        ask_vol_tot = job.get_volume(world_state.ask_raw_orders)
+        vol_aggr, vol_pass = jax.lax.cond(
+            agent_state.is_sell_task,
+            lambda: (bid_vol_tot, ask_vol_tot),
+            lambda: (ask_vol_tot, bid_vol_tot),
+        )
+
+        # Calculate OBI (Order Book Imbalance)
+        total_volume = bid_vol_tot + ask_vol_tot
+        obi = jnp.where(
+            total_volume > 0,
+            (bid_vol_tot - ask_vol_tot) / total_volume,
+            0.0
+        )
+
+        sign_switch = 2 * agent_state.is_sell_task - 1
+        if self.world_config.ep_type == "fixed_time":
+            time = world_state.time[0] + world_state.time[1]/1e9
+            time_elapsed = time - (world_state.init_time[0] + world_state.init_time[1]/1e9)
+            time_remaining = self.world_config.episode_time - time_elapsed
+            
+            # Calculate execution pace required (volume per unit time)
+            remaining_quant = agent_state.task_to_execute - agent_state.quant_executed
+            time_remaining_safe = jnp.maximum(time_remaining, 0.01)  # Avoid division by zero
+            execution_pace = remaining_quant / time_remaining_safe
+            
+            obs = {
+                "is_sell_task": agent_state.is_sell_task,
+                "p_aggr": quote_aggr[0],
+                "p_pass": quote_pass[0],
+                "spread": jnp.abs(quote_aggr[0] - quote_pass[0]),
+                "q_aggr": vol_aggr,
+                "q_pass": vol_pass,
+                "time": time,
+                "delta_time": world_state.delta_time,
+                "time_remaining": time_remaining,
+                "init_price": agent_state.init_price,
+                "task_size": agent_state.task_to_execute,
+                "executed_quant": agent_state.quant_executed,
+                "remaining_quant": remaining_quant,
+                "step_counter": world_state.step_counter,
+                "remaining_ratio": jnp.where(world_state.max_steps_in_episode==0, 0., 1. - world_state.step_counter / world_state.max_steps_in_episode),
+                "obi": obi,
+                "execution_pace": execution_pace,
+            }
+            means = {
+                "is_sell_task": 0,
+                "p_aggr": agent_state.init_price,
+                "p_pass": agent_state.init_price,
+                "spread": 0,
+                "q_aggr": 0,
+                "q_pass": 0,
+                "time": 0,
+                "delta_time": 0,
+                "time_remaining": 0,
+                "init_price": 0,
+                "task_size": 0,
+                "executed_quant": 0,
+                "remaining_quant": 0,
+                "step_counter": 0,
+                "remaining_ratio": 0,
+                "obi": 0,
+                "execution_pace": 0,
+            }
+            stds = {
+                "is_sell_task": 1,
+                "p_aggr": 1e5,
+                "p_pass": 1e5,
+                "spread": 1e4,
+                "q_aggr": 1000,
+                "q_pass": 1000,
+                "time": 1e5,
+                "delta_time": 10,
+                "time_remaining": self.world_config.episode_time,
+                "init_price": 1e7,
+                "task_size": self.cfg.task_size,
+                "executed_quant": self.cfg.task_size,
+                "remaining_quant": self.cfg.task_size,
+                "step_counter": 30,
+                "remaining_ratio": 1,
+                "obi": 1.0,
+                "execution_pace": self.cfg.task_size / max(self.world_config.episode_time, 1),
+            }
+        elif self.world_config.ep_type == "fixed_steps":
+            # Calculate execution pace required (volume per remaining step)
+            remaining_steps = world_state.max_steps_in_episode - world_state.step_counter
+            remaining_steps = jnp.maximum(remaining_steps, 1)  # Avoid division by zero
+            remaining_quant = agent_state.task_to_execute - agent_state.quant_executed
+            execution_pace = remaining_quant / remaining_steps
+            
+            obs = {
+                "is_sell_task": agent_state.is_sell_task,
+                "p_aggr": quote_aggr[0],
+                "p_pass": quote_pass[0],
+                "spread": jnp.abs(quote_aggr[0] - quote_pass[0]),
+                "q_aggr": vol_aggr,
+                "q_pass": vol_pass,
+                "init_price": agent_state.init_price,
+                "task_size": agent_state.task_to_execute,
+                "executed_quant": agent_state.quant_executed,
+                "remaining_quant": remaining_quant,
+                "step_counter": world_state.step_counter,
+                "remaining_ratio": jnp.where(world_state.max_steps_in_episode==0, 0., 1. - world_state.step_counter / world_state.max_steps_in_episode),
+                "obi": obi,
+                "execution_pace": execution_pace,
+            }
+            means = {
+                "is_sell_task": 0,
+                "p_aggr": agent_state.init_price,
+                "p_pass": agent_state.init_price,
+                "spread": 0,
+                "q_aggr": 0,
+                "q_pass": 0,
+                "init_price": 0,
+                "task_size": 0,
+                "executed_quant": 0,
+                "remaining_quant": 0,
+                "step_counter": 0,
+                "remaining_ratio": 0,
+                "obi": 0,
+                "execution_pace": 0,
+            }
+            stds = {
+                "is_sell_task": 1,
+                "p_aggr": 1e5,
+                "p_pass": 1e5,
+                "spread": 1e4,
+                "q_aggr": 1000,
+                "q_pass": 1000,
+                "init_price": 1e7,
+                "task_size": self.cfg.task_size,
+                "executed_quant": self.cfg.task_size,
+                "remaining_quant": self.cfg.task_size,
+                "step_counter": max(self.world_config.episode_time, 1),
+                "remaining_ratio": 1,
+                "obi": 1.0,
+                "execution_pace": self.cfg.task_size / 64.0,
+            }
+
+        if normalize:
+            obs = self.normalize_obs(obs, means, stds)
+
+        if flatten:
+            obs, _ = jax.flatten_util.ravel_pytree(obs)
+
+        return obs
 
     def _get_obs_vwap_engineered(
             self,
             agent_state: ExecEnvState,
+
             world_state: WorldState,
             normalize: bool,
             flatten: bool = True,
@@ -2392,6 +2542,12 @@ class ExecutionAgent():
                 space = spaces.Box(-10000, 10000, (15,), dtype=jnp.float32) 
             elif self.world_config.ep_type == "fixed_steps":
                 space = spaces.Box(-10000, 10000, (12,), dtype=jnp.float32) 
+            return space
+        elif self.cfg.observation_space == "engineered_with_obi":
+            if self.world_config.ep_type == "fixed_time":
+                space = spaces.Box(-10000, 10000, (17,), dtype=jnp.float32)  # 15 + OBI + execution_pace
+            elif self.world_config.ep_type == "fixed_steps":
+                space = spaces.Box(-10000, 10000, (14,), dtype=jnp.float32)  # 13 base + OBI + execution_pace
             return space
         elif self.cfg.observation_space == "simplest_case":
             space = spaces.Box(-10000, 10000, (3,), dtype=jnp.float32) 

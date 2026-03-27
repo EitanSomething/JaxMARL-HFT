@@ -2,9 +2,9 @@
 # apply differently to each ntwrk
 # Should match with NUM_AGENTS_PER_TYPE
 
-"LR": [0.001]  # HP (v2_Exec_FixedQuantsComplex_Ablations) shows 0.001 better than 0.0005 and 0.0015 (But only marginally) 
+"LR": [0.0003]  # Lowered from 0.001 for better convergence on TWAP; annealing enabled to stabilize training
 "NUM_ENVS": 4096 #2048 #2048 #128
-"NUM_STEPS": 126
+"NUM_STEPS": 64
 "NUM_STEPS_EVAL" : 63
 "GRU_HIDDEN_DIM": 128
 "FC_DIM_SIZE": 128
@@ -24,7 +24,7 @@
 "SEED": 2
 "N_DEVICES": 1
 "ENV_CONFIG": "config/env_configs/exec_debug_fixed_quants_complex.json"
-"ANNEAL_LR": [False]
+"ANNEAL_LR": [True]
 
 # Network architecture: rnn | rnn_wide | rnn_deep | transformer
 "ARCHITECTURE": "rnn"

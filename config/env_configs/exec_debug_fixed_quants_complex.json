@@ -42,7 +42,7 @@
       "action_type": "pure",
       "task": "random",
       "action_space": "fixed_quants_complex",
-      "observation_space": "engineered",
+      "observation_space": "engineered_with_obi",
       "reward_function": "normal",
       "task_size": 600,
       "n_ticks_in_book": 1,

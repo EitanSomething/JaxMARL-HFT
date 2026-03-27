@@ -596,6 +596,7 @@ def _merge_params_by_key(target_params, source_params):
 
 
 def make_train(config):
+    np.random.seed(config["SEED"])
     # scenario = map_name_to_scenario(config["MAP_NAME"])
     init_key = jax.random.PRNGKey(config["SEED"])
     # Create a MultiAgentConfig object with parameters from the config
@@ -689,7 +690,13 @@ def make_train(config):
 
                 init_hstate_local = ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
                 network_params_local = network.init(_rng_local, init_hstate_local, init_x_local)
-                if config["ANNEAL_LR"][i]:
+                if training_mode == "bc":
+                    bc_lr = float(config.get("BC_LR", 1e-4))
+                    tx = optax.chain(
+                        optax.clip_by_global_norm(config["MAX_GRAD_NORM"][i]),
+                        optax.adam(bc_lr, eps=1e-5),
+                    )
+                elif config["ANNEAL_LR"][i]:
                     tx = optax.chain(
                         optax.clip_by_global_norm(config["MAX_GRAD_NORM"][i]),
                         optax.adam(learning_rate=functools.partial(linear_schedule, config["LR"][i]), eps=1e-5),
@@ -722,7 +729,7 @@ def make_train(config):
             # Behavior Cloning: Collect trajectories from environment using expert policies
             expert_policy = config.get("EXPERT_POLICY", "twap")
             bc_episodes = int(config.get("BC_EPISODES", 50))
-            bc_epochs = int(config.get("BC_EPOCHS", 10))
+            bc_epochs = int(config.get("BC_EPOCHS", 50))
             bc_batch_size = int(config.get("BC_BATCH_SIZE", 256))
             bc_log_every = int(config.get("BC_LOG_EVERY", 1))
             
@@ -736,6 +743,9 @@ def make_train(config):
             episode_prices_slippage = {i: [] for i in range(len(env.instance_list))}
             per_step_slippage = {i: {step: [] for step in range(config["NUM_STEPS"])} for i in range(len(env.instance_list))}
             
+            # Track steps since last execution per environment per agent for temporal features
+            steps_since_exec_buffer = {i: [] for i in range(len(env.instance_list))}
+            
             for episode_num in range(bc_episodes):
                 rng, reset_key = jax.random.split(rng)
                 reset_rng = jax.random.split(reset_key, config["NUM_ENVS"])
@@ -744,6 +754,7 @@ def make_train(config):
                 # Initialize hidden states and dones for all agents
                 hstates_local = []
                 init_dones_local = []
+                
                 for i in range(len(env.instance_list)):
                     hstates_local.append(ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"]))
                     init_dones_local.append(jnp.zeros((config["NUM_ENVS"],), dtype=bool))
@@ -760,12 +771,17 @@ def make_train(config):
                             twap_action = 1 if (step_idx % 10) == 0 else 0
                             action = jnp.full((config["NUM_ENVS"],), twap_action, dtype=jnp.int32)
                         elif expert_policy.lower() == "vwap":
-                            # VWAP: front-loaded (70% in first half, 30% in second half)
-                            if step_idx < 0.7 * config["NUM_STEPS"]:
-                                vwap_action = 1
-                            else:
-                                vwap_action = 0
-                            action = jnp.full((config["NUM_ENVS"],), vwap_action, dtype=jnp.int32)
+                            # VWAP: execute proportional to a U-shaped intraday volume curve
+                            # (high at open/close, low midday) — typical equity volume profile.
+                            # Stochastic per-env to prevent trivial memorization.
+                            progress = step_idx / max(config["NUM_STEPS"] - 1, 1)  # 0 to 1
+                            # U-shaped: 4*(x-0.5)^2 gives ~1.0 at edges, ~0.0 at midpoint
+                            u_shape = 4.0 * (progress - 0.5) ** 2
+                            # Scale so average exec rate ~= target (tune base to hit ~10-15% per step)
+                            exec_prob = min(0.15 + 0.25 * u_shape, 1.0)
+                            rng, vwap_key = jax.random.split(rng)
+                            rand_vals = jax.random.uniform(vwap_key, shape=(config["NUM_ENVS"],))
+                            action = (rand_vals < exec_prob).astype(jnp.int32)
                         else:
                             # Random fallback
                             subkeys = jax.random.split(policy_key, config["NUM_ENVS"])
@@ -774,8 +790,10 @@ def make_train(config):
                     
                     # Store observations and actions
                     for i in range(len(env.instance_list)):
-                        obs_buffer[i].append(np.asarray(obsv[i]))
-                        action_buffer[i].append(np.asarray(actions[i]))
+                        obs_np = np.asarray(obsv[i])
+                        action_np = np.asarray(actions[i])
+                        obs_buffer[i].append(obs_np)
+                        action_buffer[i].append(action_np)
                     
                     # Step environment
                     obsv, env_state, reward, done, info = jax.vmap(
@@ -802,7 +820,7 @@ def make_train(config):
                     if np.all(done_all):
                         break
             
-            print(f"BC Dataset Statistics:")
+            print(f"BC Dataset Statistics (temporal feature included):")
             
             # Print collected price slippage statistics
             for i in range(len(env.instance_list)):
@@ -869,26 +887,50 @@ def make_train(config):
             
             for i, train_state in enumerate(train_states):
                 # Convert buffers to arrays
-                obs = np.concatenate(obs_buffer[i], axis=0)  # (total_steps, num_envs, obs_dim)
-                actions = np.concatenate(action_buffer[i], axis=0)  # (total_steps, num_envs)
-                dones = np.concatenate(done_buffer[i], axis=0)  # (total_steps, num_envs)
+                obs = np.concatenate(obs_buffer[i], axis=0)  # (total_steps, num_envs, obs_dim) with temporal feature
+                actions_flat = np.concatenate(action_buffer[i], axis=0)  # (total_steps * num_envs,) - flattened 1D
+                dones_flat = np.concatenate(done_buffer[i], axis=0)  # (total_steps * num_envs,) - flattened 1D
                 
-                print(f"  Agent {i}: obs shape {obs.shape}, actions {actions.shape}, dones {dones.shape}")
+                print(f"  Agent {i}: obs shape {obs.shape} [WITH temporal feature], actions {actions_flat.shape}, dones {dones_flat.shape}")
                 
                 # Reshape for BC training
-                obs = obs.reshape(-1, obs.shape[-1])  # Flatten environments and steps
-                actions = actions.reshape(-1)
-                dones = dones.reshape(-1)
+                obs = obs.reshape(-1, obs.shape[-1])  # Flatten environments and steps preserving features
+                actions = actions_flat.reshape(-1)
+                dones = dones_flat.reshape(-1)
                 
                 num_samples = len(actions)
                 if num_samples == 0:
                     raise ValueError(f"BC dataset for agent {i} is empty")
                 
-                # Split train/val
-                val_split = int(0.2 * num_samples)
-                perm = np.random.permutation(num_samples)
-                val_idx = perm[:val_split]
-                train_idx = perm[val_split:]
+                # Split train/val using stratified sampling by time step
+                train_idx = []
+                val_idx = []
+                # Calculate time step for each sample (assuming layout is [episodes * NUM_STEPS * NUM_ENVS])
+                # Note: flattened layout means step_idx cycle every config["NUM_STEPS"]*config["NUM_ENVS"]?
+                # Actually, the buffer was appended as (episode, step) with each step being (NUM_ENVS,)
+                # So the array has shape (episodes * NUM_STEPS, NUM_ENVS)
+                # When flattened: it's grouped by episode, then step, then environment.
+                # So step index is: (np.arange(num_samples) // config["NUM_ENVS"]) % config["NUM_STEPS"]
+                step_indices = (np.arange(num_samples) // config["NUM_ENVS"]) % config["NUM_STEPS"]
+                
+                for step_val in range(config["NUM_STEPS"]):
+                    idx_for_step = np.where(step_indices == step_val)[0]
+                    # Make it deterministic according to seed
+                    np.random.shuffle(idx_for_step)
+                    split_point = int(0.2 * len(idx_for_step))
+                    val_idx.extend(idx_for_step[:split_point])
+                    train_idx.extend(idx_for_step[split_point:])
+                
+                train_idx = np.array(train_idx)
+                val_idx = np.array(val_idx)
+                np.random.shuffle(train_idx)
+                np.random.shuffle(val_idx)
+                
+                # Save train/val indices for reproducibility
+                import os
+                os.makedirs(f"saved_npz/{config.get('PROJECT', 'default_project')}", exist_ok=True)
+                np.savez(f"saved_npz/{config.get('PROJECT', 'default_project')}/agent_{i}_data_splits.npz", train_idx=train_idx, val_idx=val_idx)
+
                 
                 obs_train = obs[train_idx]
                 actions_train = actions[train_idx]
@@ -907,34 +949,50 @@ def make_train(config):
                 class_dist_train = {int(k): int(v) for k, v in zip(unique_train, counts_train)}
                 class_dist_val = {int(k): int(v) for k, v in zip(unique_val, counts_val)}
                 
+                # Expected execution rate for expert policy
+                expected_exec_rate = actions_train.mean()  # Fraction of execute actions
+                
                 # Compute class weights (inverse frequency) to handle imbalance
                 n_class_0 = np.sum(actions_train == 0)
                 n_class_1 = np.sum(actions_train == 1)
-                weight_class_0 = n_class_1 / (n_class_0 + n_class_1) if n_class_0 > 0 else 1.0
-                weight_class_1 = n_class_0 / (n_class_0 + n_class_1) if n_class_1 > 0 else 1.0
-                print(f"  Agent {i} class weights - class_0: {weight_class_0:.4f}, class_1: {weight_class_1:.4f}")
+                
+                # Compute class weights based on expert policy
+                # TWAP (~10% execute): heavily upweight execute class
+                # VWAP (~70% execute): lightly upweight no-execute class
+                if expert_policy.lower() == "twap":
+                    weight_class_0 = 1.0
+                    weight_class_1 = float(n_class_0) / max(n_class_1, 1)
+                else:  # vwap
+                    weight_class_0 = float(n_class_1) / max(n_class_0, 1)
+                    weight_class_1 = 1.0
+                print(f"  Agent {i} expert execute rate: {expected_exec_rate:.4f} (should be ~0.1 for TWAP, ~0.5 for VWAP)")
+                print(f"  Agent {i} class distribution - Train: {dict(zip(unique_train, counts_train))}, Val: {dict(zip(unique_val, counts_val))}")
+                print(f"  Agent {i} class weights ({expert_policy.upper()}) - class_0: {weight_class_0:.4f}, class_1: {weight_class_1:.4f}")
                 
                 @jax.jit
                 def _bc_update(train_state_in, obs_batch, done_batch, action_batch):
                     def _loss_fn(params):
-                        # Reshape for time dimension
                         init_h = ScannedRNN.initialize_carry(obs_batch.shape[0], config["GRU_HIDDEN_DIM"])
-                        obs_t = jnp.expand_dims(obs_batch, 0)  # Add time dim
+                        obs_t = jnp.expand_dims(obs_batch, 0)
                         done_t = jnp.expand_dims(done_batch, 0)
-                        action_t = jnp.expand_dims(action_batch, 0)
                         _, pi = train_state_in.apply_fn(params, init_h, (obs_t, done_t))
-                        log_probs = pi.log_prob(action_t)
-                        
-                        # Apply class weights: give higher weight to minority class
-                        # action_batch is in range [0, num_actions-1]
+                        log_probs = pi.log_prob(jnp.expand_dims(action_batch, 0))
                         weights = jnp.where(action_batch == 0, weight_class_0, weight_class_1)
-                        weighted_log_probs = log_probs.squeeze(0) * weights
-                        return -weighted_log_probs.mean()
+                        return -(log_probs.squeeze(0) * weights).mean()
                     
                     loss, grads = jax.value_and_grad(_loss_fn)(train_state_in.params)
                     train_state_out = train_state_in.apply_gradients(grads=grads)
                     return train_state_out, loss
                 
+                def _compute_bc_loss(train_state_in, obs_batch, done_batch, action_batch):
+                    init_h = ScannedRNN.initialize_carry(obs_batch.shape[0], config["GRU_HIDDEN_DIM"])
+                    obs_t = jnp.expand_dims(obs_batch, 0)
+                    done_t = jnp.expand_dims(done_batch, 0)
+                    action_t = jnp.expand_dims(action_batch, 0)
+                    _, pi = train_state_in.apply_fn(train_state_in.params, init_h, (obs_t, done_t))
+                    log_probs = pi.log_prob(action_t)
+                    return -log_probs.mean()
+
                 def _compute_bc_metrics(train_state_in, obs_batch, done_batch, action_batch):
                     """Compute accuracy, precision, recall, F1, and confusion matrix elements"""
                     init_h = ScannedRNN.initialize_carry(obs_batch.shape[0], config["GRU_HIDDEN_DIM"])
@@ -1027,6 +1085,12 @@ def make_train(config):
                     eval_runner_state_init = (train_states_current, eval_env_state, eval_obsv, init_dones_agents_eval, eval_hstates, eval_rng_in)
                     _, eval_slippage_traj = jax.lax.scan(_bc_eval_step, eval_runner_state_init, None, config["NUM_STEPS"])
                     return eval_slippage_traj
+                best_val_loss = float('inf')
+                patience_counter = 0
+                early_stop_patience = config.get("BC_EARLY_STOP_PATIENCE", 8)
+                min_epochs_before_stop = config.get("BC_MIN_EPOCHS", 10)
+                best_train_state = train_state
+                
                 for epoch in range(bc_epochs):
                     perm = np.random.permutation(num_train_samples)
                     losses_this_epoch = []
@@ -1061,17 +1125,34 @@ def make_train(config):
                     
                     epoch_loss = float(np.mean(losses_this_epoch))
 
-                    # Capture actual models behaviour slippage natively.
+                    # Capture actual models behaviour slippage natively safely.
                     rng, _run_eval_rng = jax.random.split(rng)
                     train_states[i] = train_state
-                    eval_slippage_traj = _run_model_eval(train_states, _run_eval_rng)
                     
+                    # RUN MULTIPLE EVALUATION ROLLOUTS AND AVERAGE
+                    num_eval_eps = config.get("BC_EVAL_EPISODES", 5)
+                    eval_slip_list = []
+                    for _ in range(num_eval_eps):
+                        _run_eval_rng, next_rng = jax.random.split(_run_eval_rng)
+                        e_slip = _run_model_eval(train_states, next_rng)
+                        if i < len(e_slip):
+                            eval_slip_list.append(np.asarray(e_slip[i]))
+                            
                     true_model_slippage_bps = None
-                    if i < len(eval_slippage_traj):
-                        true_model_slippage_bps = float(np.mean(np.asarray(eval_slippage_traj[i])))
+                    true_model_slippage_std = None
+                    if eval_slip_list:
+                        # Log per-episode slippage: Track variance to identify outliers
+                        # eval_slip_list has num_eval_eps arrays
+                        episode_means = [float(np.mean(slip)) for slip in eval_slip_list]
+                        true_model_slippage_bps = float(np.mean(episode_means))
+                        if len(episode_means) > 1:
+                            true_model_slippage_std = float(np.std(episode_means))
+                        else:
+                            true_model_slippage_std = float(np.std(eval_slip_list[0]))
                     
                     # Compute validation metrics every epoch
                     val_metrics = _compute_bc_metrics(train_state, jnp.asarray(obs_val), jnp.asarray(dones_val), jnp.asarray(actions_val))
+                    val_loss = float(_compute_bc_loss(train_state, jnp.asarray(obs_val), jnp.asarray(dones_val), jnp.asarray(actions_val)))
                     
                     # Compute price slippage metric from validation episodes
                     price_slippage_bps = None
@@ -1097,6 +1178,7 @@ def make_train(config):
                         try:
                             log_dict = {
                                 f"bc/agent_{agent_type_names[i]}/epoch_loss": epoch_loss,
+                                f"bc/agent_{agent_type_names[i]}/val_loss": val_loss,
                                 f"bc/agent_{agent_type_names[i]}/val_accuracy": val_metrics["accuracy"],
                                 f"bc/agent_{agent_type_names[i]}/val_precision": val_metrics["precision"],
                                 f"bc/agent_{agent_type_names[i]}/val_recall": val_metrics["recall"],
@@ -1109,6 +1191,9 @@ def make_train(config):
                             # Add price slippage metric if available
                             if true_model_slippage_bps is not None:
                                 log_dict[f"bc/agent_{agent_type_names[i]}/price_slippage_bps"] = true_model_slippage_bps
+                            if true_model_slippage_std is not None:
+                                log_dict[f"bc/agent_{agent_type_names[i]}/price_slippage_std"] = true_model_slippage_std
+                                
                             wandb.log(log_dict, step=global_step_for_bc, commit=True)
                             global_step_for_bc += 1
                         except Exception as e:
@@ -1129,8 +1214,20 @@ def make_train(config):
                                 step_mean_min = float(np.min(step_means)) if step_means else 0.0
                                 step_mean_max = float(np.max(step_means)) if step_means else 0.0
                                 slippage_str += f" [per-step: avg={step_mean_avg:.2f}bps, min={step_mean_min:.2f}bps, max={step_mean_max:.2f}bps]"
-                        print(f"BC agent {i} epoch {epoch + 1}/{bc_epochs} loss={epoch_loss:.6f} val_acc={val_metrics['accuracy']:.4f} val_f1={val_metrics['f1']:.4f}{slippage_str}")
+                        print(f"BC agent {i} epoch {epoch + 1}/{bc_epochs} loss={epoch_loss:.6f} val_loss={val_loss:.6f} val_acc={val_metrics['accuracy']:.4f} val_f1={val_metrics['f1']:.4f}{slippage_str}")
                 
+                    # Early stopping based on validation loss
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        patience_counter = 0
+                        best_train_state = train_state
+                    else:
+                        patience_counter += 1
+                        if patience_counter >= early_stop_patience and (epoch + 1) >= min_epochs_before_stop:
+                            print(f"Early stopping at epoch {epoch + 1} for agent {i}. Best val_loss: {best_val_loss:.6f}")
+                            train_state = best_train_state
+                            break
+
                 bc_losses.append(epoch_loss)
                 train_states[i] = train_state
             
@@ -1204,17 +1301,33 @@ def make_train(config):
             # Run scan 
             print("Jitting evaluation loop...")
             bc_eval_scan = jax.jit(lambda state: jax.lax.scan(_bc_eval_step, state, None, config["NUM_STEPS"]))
-            _, eval_slippage_traj = bc_eval_scan(eval_runner_state)
+            
+            num_eval_episodes = int(config.get("BC_EVAL_EPISODES", 5))
+            all_eval_slippage = {i_ag: [] for i_ag in range(len(train_states))}
+            
+            current_eval_runner_state = eval_runner_state
+            for _ in range(num_eval_episodes):
+                # We need to refresh the rng inside the state to get new trajectories
+                rng, step_eval_rng = jax.random.split(current_eval_runner_state[-1])
+                new_state = current_eval_runner_state[:-1] + (step_eval_rng,)
+                current_eval_runner_state, eval_slippage_traj = bc_eval_scan(new_state)
+                for i_ag in range(len(train_states)):
+                    all_eval_slippage[i_ag].append(np.asarray(eval_slippage_traj[i_ag]))
             
             # Parse and log metrics
             for i_ag in range(len(train_states)):
-                agent_slip = np.asarray(eval_slippage_traj[i_ag])
-                actual_slippage = float(np.mean(agent_slip))
-                print(f"Agent {i_ag} True Model Mean Slippage: {actual_slippage:.2f} bps")
+                # list of num_eval_episodes arrays of shape (NUM_STEPS, NUM_ENVS)
+                episodes_data = all_eval_slippage[i_ag]
+                episode_means = [float(np.mean(ep)) for ep in episodes_data]
+                
+                actual_slippage = float(np.mean(episode_means))
+                std_slippage = float(np.std(episode_means)) if len(episode_means) > 1 else float(np.std(episodes_data[0]))
+                
+                print(f"Agent {i_ag} True Model Mean Slippage: {actual_slippage:.2f} bps (averaged over {num_eval_episodes} rollouts)")
                 if config["WANDB_MODE"] != "disabled" and run is not None:
                     wandb.log({
                         f"bc/agent_{agent_type_names[i_ag]}/true_model_price_slippage_bps": actual_slippage,
-                        f"bc/agent_{agent_type_names[i_ag]}/true_model_price_slippage_std": float(np.std(agent_slip))
+                        f"bc/agent_{agent_type_names[i_ag]}/true_model_price_slippage_std": std_slippage
                     }, commit=False)
 
             # Save checkpoint
