@@ -22,6 +22,8 @@ logging.getLogger('absl').setLevel(logging.ERROR)
 import time
 import jax # type: ignorepip 
 jax.config.update('jax_disable_jit', False)
+jax.config.update('jax_compilation_cache_dir', '/tmp/jax_cache')
+jax.config.update('jax_persistent_cache_min_compile_time_secs', 5)
 
 import jax.numpy as jnp # type: ignore
 import flax.linen as nn
@@ -595,6 +597,56 @@ def _merge_params_by_key(target_params, source_params):
     return freeze(_merge(target_dict, source_dict))
 
 
+def _compute_vwap_volume_schedule(data_path, stock, time_period, num_steps, day_start=34200, day_end=57600):
+    """
+    Compute a normalized intraday volume schedule from all historical years strictly
+    before time_period for the given stock. Falls back to uniform if no prior data.
+    """
+    import glob as glob_mod
+    import pandas as pd
+
+    stock_root = f"{data_path}/rawLOBSTER/{stock}"
+    all_period_dirs = sorted(glob_mod.glob(f"{stock_root}/*/"))
+    prior_dirs = [d for d in all_period_dirs if os.path.basename(d.rstrip('/')) < str(time_period)]
+
+    files = []
+    for d in prior_dirs:
+        files.extend(sorted(glob_mod.glob(f"{d}*message*.csv")))
+
+    if not files:
+        print(f"  [VWAP schedule] No prior-year files found before {time_period} in {stock_root}, using uniform.")
+        return np.ones(num_steps, dtype=np.float32) / num_steps
+
+    horizon = day_end - day_start
+    bucket_size = horizon / num_steps
+    volume_accum = np.zeros(num_steps, dtype=np.float64)
+
+    for f in files:
+        try:
+            df = pd.read_csv(f, header=None, usecols=[0, 1, 3], names=["time", "type", "qty"])
+            exec_df = df[df["type"].isin([4, 5])]
+            exec_df = exec_df[(exec_df["time"] >= day_start) & (exec_df["time"] < day_end)]
+            if exec_df.empty:
+                continue
+            buckets = np.clip(
+                np.floor((exec_df["time"].values - day_start) / bucket_size).astype(int),
+                0, num_steps - 1
+            )
+            np.add.at(volume_accum, buckets, np.abs(exec_df["qty"].values))
+        except Exception:
+            continue
+
+    total = volume_accum.sum()
+    if total == 0:
+        print("  [VWAP schedule] Zero total volume in prior years, using uniform.")
+        return np.ones(num_steps, dtype=np.float32) / num_steps
+
+    schedule = (volume_accum / total).astype(np.float32)
+    print(f"  [VWAP schedule] Built from {len(files)} file(s) across {len(prior_dirs)} prior period(s). "
+          f"Top-3 buckets: {np.argsort(schedule)[::-1][:3].tolist()}")
+    return schedule
+
+
 def make_train(config):
     np.random.seed(config["SEED"])
     # scenario = map_name_to_scenario(config["MAP_NAME"])
@@ -735,92 +787,131 @@ def make_train(config):
             
             print(f"Behavior Cloning: Collecting {bc_episodes} episodes using {expert_policy.upper()} policy...")
             print(f"  WANDB_MODE={config['WANDB_MODE']}, run={run}, run is not None={run is not None}")
-            
-            # Collect trajectories from environment rollouts
-            obs_buffer = {i: [] for i in range(len(env.instance_list))}
-            action_buffer = {i: [] for i in range(len(env.instance_list))}
-            done_buffer = {i: [] for i in range(len(env.instance_list))}
-            episode_prices_slippage = {i: [] for i in range(len(env.instance_list))}
-            per_step_slippage = {i: {step: [] for step in range(config["NUM_STEPS"])} for i in range(len(env.instance_list))}
-            
-            # Track steps since last execution per environment per agent for temporal features
-            steps_since_exec_buffer = {i: [] for i in range(len(env.instance_list))}
-            
-            for episode_num in range(bc_episodes):
-                rng, reset_key = jax.random.split(rng)
-                reset_rng = jax.random.split(reset_key, config["NUM_ENVS"])
-                obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
-                
-                # Initialize hidden states and dones for all agents
-                hstates_local = []
-                init_dones_local = []
-                
-                for i in range(len(env.instance_list)):
-                    hstates_local.append(ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"]))
-                    init_dones_local.append(jnp.zeros((config["NUM_ENVS"],), dtype=bool))
-                
-                for step_idx in range(config["NUM_STEPS"]):
-                    rng, policy_key, step_key = jax.random.split(rng, 3)
-                    step_keys = jax.random.split(step_key, config["NUM_ENVS"])
-                    
-                    # Get expert actions (using env's action space)
-                    actions = []
-                    for i, space in enumerate(env.action_spaces):
-                        if expert_policy.lower() == "twap":
-                            # TWAP: execute every 10 steps
-                            twap_action = 1 if (step_idx % 10) == 0 else 0
-                            action = jnp.full((config["NUM_ENVS"],), twap_action, dtype=jnp.int32)
-                        elif expert_policy.lower() == "vwap":
-                            # VWAP: execute proportional to a U-shaped intraday volume curve
-                            # (high at open/close, low midday) — typical equity volume profile.
-                            # Stochastic per-env to prevent trivial memorization.
-                            progress = step_idx / max(config["NUM_STEPS"] - 1, 1)  # 0 to 1
-                            # U-shaped: 4*(x-0.5)^2 gives ~1.0 at edges, ~0.0 at midpoint
-                            u_shape = 4.0 * (progress - 0.5) ** 2
-                            # Scale so average exec rate ~= target (tune base to hit ~10-15% per step)
-                            exec_prob = min(0.15 + 0.25 * u_shape, 1.0)
-                            rng, vwap_key = jax.random.split(rng)
-                            rand_vals = jax.random.uniform(vwap_key, shape=(config["NUM_ENVS"],))
-                            action = (rand_vals < exec_prob).astype(jnp.int32)
-                        else:
-                            # Random fallback
-                            subkeys = jax.random.split(policy_key, config["NUM_ENVS"])
-                            action = jax.vmap(space.sample)(subkeys)
-                        actions.append(action)
-                    
-                    # Store observations and actions
-                    for i in range(len(env.instance_list)):
-                        obs_np = np.asarray(obsv[i])
-                        action_np = np.asarray(actions[i])
-                        obs_buffer[i].append(obs_np)
-                        action_buffer[i].append(action_np)
-                    
-                    # Step environment
-                    obsv, env_state, reward, done, info = jax.vmap(
-                        env.step, in_axes=(0, 0, 0, None)
-                    )(step_keys, env_state, actions, env_params)
-                    
-                    # Store dones and collect price slippage at every step
-                    for i in range(len(env.instance_list)):
-                        done_np = np.asarray(done["agents"][i])
-                        done_buffer[i].append(done_np)
-                        
-                        # Collect price slippage from every step (average later)
-                        if "adj_slippage_bps" in info["agents"][i]:
-                            adj_slip_np = np.asarray(info["agents"][i]["adj_slippage_bps"])
-                            # adj_slip_np has shape (NUM_ENVS,), extract mean for this step
-                            step_mean_slippage = float(np.mean(adj_slip_np))
-                            episode_prices_slippage[i].append(step_mean_slippage)
-                            # Also collect per-step slippage for statistics
-                            if step_idx < config["NUM_STEPS"]:
-                                per_step_slippage[i][step_idx].append(step_mean_slippage)
-                    
-                    # Reset on episode done
-                    done_all = np.asarray(done["__all__"])
-                    if np.all(done_all):
-                        break
-            
-            print(f"BC Dataset Statistics (temporal feature included):")
+
+            # VWAP: precompute volume schedule from historical data
+            if expert_policy.lower() == "vwap":
+                _wc = config["world_config"]
+                vwap_vol_schedule = _compute_vwap_volume_schedule(
+                    data_path=_wc["dataPath"],
+                    stock=_wc.get("stock", "AMZN"),
+                    time_period=str(config["TimePeriod"]),
+                    num_steps=config["NUM_STEPS"],
+                    day_start=_wc.get("day_start", 34200),
+                    day_end=_wc.get("day_end", 57600),
+                )
+                # Match DNN-Agent ratio: 130 child orders / 460 buckets ≈ 28.3%
+                vwap_n_execute = max(1, round(config["NUM_STEPS"] * 130 / 460))
+                vwap_top_steps = set(np.argsort(vwap_vol_schedule)[::-1][:vwap_n_execute].tolist())
+                print(f"  [VWAP schedule] Labelling {vwap_n_execute} steps as execute=1. "
+                      f"Top steps: {sorted(vwap_top_steps)[:10]}")
+
+            # Build per-agent action schedule arrays: shape (NUM_STEPS,), values 0/1
+            n_agents = len(env.instance_list)
+            action_schedules = []
+            for _i in range(n_agents):
+                sched = np.zeros(config["NUM_STEPS"], dtype=np.int32)
+                for s in range(config["NUM_STEPS"]):
+                    if expert_policy.lower() == "twap":
+                        sched[s] = 1 if (s % 10) == 0 else 0
+                    else:
+                        sched[s] = 1 if s in vwap_top_steps else 0
+                action_schedules.append(jnp.array(sched))
+
+            # Cache key: everything that determines the collected data
+            _wc = config["world_config"]
+            _cache_key = f"{_wc.get('stock','AMZN')}_{config['TimePeriod']}_{expert_policy}" \
+                         f"_S{config['NUM_STEPS']}_E{config['NUM_ENVS']}_EP{bc_episodes}_seed{config['SEED']}"
+            _cache_dir = os.path.join(str(_wc["alphatradePath"]), "bc_cache")
+            _cache_path = os.path.join(_cache_dir, f"{_cache_key}.npz")
+
+            episode_prices_slippage = {i: [] for i in range(n_agents)}
+            per_step_slippage = {i: {step: [] for step in range(config["NUM_STEPS"])} for i in range(n_agents)}
+
+            if os.path.exists(_cache_path):
+                print(f"  [BC cache] Loading from {_cache_path}")
+                _cache = np.load(_cache_path)
+                obs_all    = [_cache[f"obs_{i}"]     for i in range(n_agents)]
+                acts_all   = [_cache[f"acts_{i}"]    for i in range(n_agents)]
+                dones_all  = [_cache[f"dones_{i}"]   for i in range(n_agents)]
+                slippage_all = [_cache[f"slip_{i}"]  for i in range(n_agents)]
+                for i in range(n_agents):
+                    for step in range(config["NUM_STEPS"]):
+                        vals = slippage_all[i][:, step].tolist()  # (episodes,)
+                        episode_prices_slippage[i].extend(vals)
+                        per_step_slippage[i][step] = vals
+            else:
+                # JIT-compiled single-episode collector (scans all steps in JAX)
+                @jax.jit
+                def _collect_episode(rng_in, action_sched_list):
+                    rng_in, reset_key = jax.random.split(rng_in)
+                    reset_rng = jax.random.split(reset_key, config["NUM_ENVS"])
+                    init_obsv, init_env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
+
+                    def _step(carry, step_idx):
+                        obsv, env_state, rng_c = carry
+                        rng_c, step_key = jax.random.split(rng_c)
+                        step_keys = jax.random.split(step_key, config["NUM_ENVS"])
+                        actions = [jnp.full((config["NUM_ENVS"],), sched[step_idx], dtype=jnp.int32)
+                                   for sched in action_sched_list]
+                        next_obsv, next_state, reward, done, info = jax.vmap(
+                            env.step, in_axes=(0, 0, 0, None)
+                        )(step_keys, env_state, actions, env_params)
+                        # collect per-agent: obs before step, action taken, done after step, slippage
+                        obs_t    = [obsv[i]                                          for i in range(n_agents)]
+                        acts_t   = [actions[i]                                       for i in range(n_agents)]
+                        dones_t  = [done["agents"][i]                                for i in range(n_agents)]
+                        slip_t   = [info["agents"][i].get("adj_slippage_bps",
+                                        jnp.zeros(config["NUM_ENVS"]))
+                                    for i in range(n_agents)]
+                        return (next_obsv, next_state, rng_c), (obs_t, acts_t, dones_t, slip_t)
+
+                    _, traj = jax.lax.scan(_step, (init_obsv, init_env_state, rng_in),
+                                           jnp.arange(config["NUM_STEPS"]))
+                    return traj  # each element: list of n_agents arrays shaped (NUM_STEPS, NUM_ENVS, ...)
+
+                print("  [BC cache] JIT-compiling collector...")
+                # obs_all/acts_all/dones_all: (episodes, NUM_STEPS, NUM_ENVS, ...)
+                obs_all   = [[] for _ in range(n_agents)]
+                acts_all  = [[] for _ in range(n_agents)]
+                dones_all = [[] for _ in range(n_agents)]
+                slippage_all = [[] for _ in range(n_agents)]  # (episodes, NUM_STEPS)
+
+                for episode_num in range(bc_episodes):
+                    rng, ep_rng = jax.random.split(rng)
+                    traj = _collect_episode(ep_rng, action_schedules)
+                    obs_t, acts_t, dones_t, slip_t = traj
+                    for i in range(n_agents):
+                        obs_all[i].append(np.asarray(obs_t[i]))    # (NUM_STEPS, NUM_ENVS, obs_dim)
+                        acts_all[i].append(np.asarray(acts_t[i]))  # (NUM_STEPS, NUM_ENVS)
+                        dones_all[i].append(np.asarray(dones_t[i]))
+                        slip_ep = np.asarray(slip_t[i], dtype=np.float32)  # (NUM_STEPS, NUM_ENVS)
+                        slippage_all[i].append(slip_ep)
+                        step_means = slip_ep.mean(axis=1).tolist()  # list of NUM_STEPS floats
+                        episode_prices_slippage[i].extend(step_means)
+                        for step, v in enumerate(step_means):
+                            per_step_slippage[i][step].append(v)
+
+                for i in range(n_agents):
+                    obs_all[i]      = np.stack(obs_all[i],      axis=0)  # (episodes, NUM_STEPS, NUM_ENVS, obs_dim)
+                    acts_all[i]     = np.stack(acts_all[i],     axis=0)
+                    dones_all[i]    = np.stack(dones_all[i],    axis=0)
+                    slippage_all[i] = np.stack(slippage_all[i], axis=0)  # (episodes, NUM_STEPS, NUM_ENVS)
+
+                os.makedirs(_cache_dir, exist_ok=True)
+                np.savez_compressed(_cache_path,
+                    **{f"obs_{i}":   obs_all[i]      for i in range(n_agents)},
+                    **{f"acts_{i}":  acts_all[i]     for i in range(n_agents)},
+                    **{f"dones_{i}": dones_all[i]    for i in range(n_agents)},
+                    **{f"slip_{i}":  slippage_all[i] for i in range(n_agents)},
+                )
+                print(f"  [BC cache] Saved to {_cache_path}")
+
+            # Flatten buffers for training: obs_buffer[i] shape (episodes*NUM_STEPS, NUM_ENVS, obs_dim)
+            obs_buffer   = {i: obs_all[i].reshape(-1, *obs_all[i].shape[2:])   for i in range(n_agents)}
+            action_buffer = {i: acts_all[i].reshape(-1, *acts_all[i].shape[2:]) for i in range(n_agents)}
+            done_buffer  = {i: dones_all[i].reshape(-1, *dones_all[i].shape[2:]) for i in range(n_agents)}
+
+            print(f"BC Dataset Statistics:")
             
             # Print collected price slippage statistics
             for i in range(len(env.instance_list)):
@@ -886,15 +977,15 @@ def make_train(config):
             global_step_for_bc = 0
             
             for i, train_state in enumerate(train_states):
-                # Convert buffers to arrays
-                obs = np.concatenate(obs_buffer[i], axis=0)  # (total_steps, num_envs, obs_dim) with temporal feature
-                actions_flat = np.concatenate(action_buffer[i], axis=0)  # (total_steps * num_envs,) - flattened 1D
-                dones_flat = np.concatenate(done_buffer[i], axis=0)  # (total_steps * num_envs,) - flattened 1D
-                
-                print(f"  Agent {i}: obs shape {obs.shape} [WITH temporal feature], actions {actions_flat.shape}, dones {dones_flat.shape}")
-                
+                # Buffers are already flat numpy arrays: (episodes*NUM_STEPS, NUM_ENVS, ...)
+                obs = obs_buffer[i]          # (episodes*NUM_STEPS, NUM_ENVS, obs_dim)
+                actions_flat = action_buffer[i]  # (episodes*NUM_STEPS, NUM_ENVS)
+                dones_flat = done_buffer[i]
+
+                print(f"  Agent {i}: obs shape {obs.shape}, actions {actions_flat.shape}, dones {dones_flat.shape}")
+
                 # Reshape for BC training
-                obs = obs.reshape(-1, obs.shape[-1])  # Flatten environments and steps preserving features
+                obs = obs.reshape(-1, obs.shape[-1])
                 actions = actions_flat.reshape(-1)
                 dones = dones_flat.reshape(-1)
                 
@@ -926,11 +1017,6 @@ def make_train(config):
                 np.random.shuffle(train_idx)
                 np.random.shuffle(val_idx)
                 
-                # Save train/val indices for reproducibility
-                import os
-                os.makedirs(f"saved_npz/{config.get('PROJECT', 'default_project')}", exist_ok=True)
-                np.savez(f"saved_npz/{config.get('PROJECT', 'default_project')}/agent_{i}_data_splits.npz", train_idx=train_idx, val_idx=val_idx)
-
                 
                 obs_train = obs[train_idx]
                 actions_train = actions[train_idx]
@@ -955,19 +1041,10 @@ def make_train(config):
                 # Compute class weights (inverse frequency) to handle imbalance
                 n_class_0 = np.sum(actions_train == 0)
                 n_class_1 = np.sum(actions_train == 1)
-                
-                # Compute class weights based on expert policy
-                # TWAP (~10% execute): heavily upweight execute class
-                # VWAP (~70% execute): lightly upweight no-execute class
-                if expert_policy.lower() == "twap":
-                    weight_class_0 = 1.0
-                    weight_class_1 = float(n_class_0) / max(n_class_1, 1)
-                else:  # vwap
-                    weight_class_0 = float(n_class_1) / max(n_class_0, 1)
-                    weight_class_1 = 1.0
-                print(f"  Agent {i} expert execute rate: {expected_exec_rate:.4f} (should be ~0.1 for TWAP, ~0.5 for VWAP)")
-                print(f"  Agent {i} class distribution - Train: {dict(zip(unique_train, counts_train))}, Val: {dict(zip(unique_val, counts_val))}")
-                print(f"  Agent {i} class weights ({expert_policy.upper()}) - class_0: {weight_class_0:.4f}, class_1: {weight_class_1:.4f}")
+                weight_class_0 = 1.0
+                weight_class_1 = float(n_class_0) / max(n_class_1, 1)
+                print(f"  Agent {i} expert execute rate: {expected_exec_rate:.4f}")
+                print(f"  Agent {i} class weights - class_0: {weight_class_0:.4f}, class_1: {weight_class_1:.4f}")
                 
                 @jax.jit
                 def _bc_update(train_state_in, obs_batch, done_batch, action_batch):

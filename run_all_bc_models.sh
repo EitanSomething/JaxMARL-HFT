@@ -28,7 +28,7 @@ echo ""
 
 # Arrays of architectures and policies
 ARCHITECTURES=("rnn" "rnn_wide" "rnn_deep" "transformer")
-POLICIES=("vwap")
+POLICIES=("vwap" "twap")
 
 # Counter for tracking
 TOTAL=0
@@ -80,7 +80,7 @@ for arch in "${ARCHITECTURES[@]}"; do
       $ARCH_PARAMS \
       WANDB_MODE=online \
       ENTITY=eitansomething-n-a \
-      PROJECT=BC-Comparison-Apple-Test9 \
+      PROJECT=BC-Comparison-Apple-Test10 \
       +wandb.name=$RUN_NAME-AAPL-MultiYear \
       TimePeriod=\'2012,2019,2020,2021\' \
       EvalTimePeriod=\'2012,2019,2020,2021\' \

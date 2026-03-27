@@ -23,7 +23,7 @@
 "NUM_AGENTS_PER_TYPE": [1]
 "SEED": 2
 "N_DEVICES": 1
-"ENV_CONFIG": "config/env_configs/exec_debug_fixed_quants_complex.json"
+"ENV_CONFIG": "config/env_configs/exec_bc_execute_hold.json"
 "ANNEAL_LR": [True]
 
 # Network architecture: rnn | rnn_wide | rnn_deep | transformer
@@ -36,7 +36,7 @@
 "TRANSFORMER_MLP_DIM": 256
 
 # Training mode: rl_cold | rl_warm | bc
-"TRAINING_MODE": "rl_cold"
+"TRAINING_MODE": "bc"
 
 # BC options (used when TRAINING_MODE="bc")
 "BC_DATA_PATH": null
