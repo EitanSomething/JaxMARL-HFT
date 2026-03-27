@@ -49,6 +49,8 @@ from gymnax_exchange.jaxob.jaxob_config import MultiAgentConfig,Execution_Enviro
 
 import wandb
 import functools
+import matplotlib
+matplotlib.use('Agg')  # Use non-GUI backend to prevent threading issues
 import matplotlib.pyplot as plt
 
 import sys
@@ -944,8 +946,8 @@ def make_train(config):
                     steps = np.arange(len(all_slippage))
                     
                     # Plot clean line of mean slippage
-                    ax.plot(steps, all_slippage, 'b-', linewidth=1.5, alpha=0.8)
-                    
+                    mean_slippage_over_envs = np.mean(all_slippage, axis=(1, 2)) 
+                    ax.plot(steps, mean_slippage_over_envs, 'b-', linewidth=1.5, alpha=0.8)                    
                     # Add zero line
                     ax.axhline(y=0, color='k', linestyle='--', alpha=0.3, linewidth=1)
                     
